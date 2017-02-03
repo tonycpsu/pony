@@ -321,7 +321,7 @@ class SQLiteProvider(DBAPIProvider):
                     raise
         DBAPIProvider.release(provider, connection, cache)
 
-    def get_pool(provider, filename, create_db=False):
+    def get_pool(provider, filename, create_db=False, **kwargs):
         if filename != ':memory:':
             # When relative filename is specified, it is considered
             # not relative to cwd, but to user module where
@@ -337,7 +337,7 @@ class SQLiteProvider(DBAPIProvider):
             # 1 - SQLiteProvider.__init__()
             # 0 - pony.dbproviders.sqlite.get_pool()
             filename = absolutize_path(filename, frame_depth=7)
-        return SQLitePool(filename, create_db)
+        return SQLitePool(filename, create_db, **kwargs)
 
     def table_exists(provider, connection, table_name, case_sensitive=True):
         return provider._exists(connection, table_name, None, case_sensitive)
@@ -491,9 +491,10 @@ def py_json_array_length(expr, path=None):
     return len(expr) if type(expr) is list else 0
 
 class SQLitePool(Pool):
-    def __init__(pool, filename, create_db): # called separately in each thread
+    def __init__(pool, filename, create_db, row_factory=None): # called separately in each thread
         pool.filename = filename
         pool.create_db = create_db
+        pool.row_factory = row_factory
         pool.con = None
     def _connect(pool):
         filename = pool.filename
@@ -501,6 +502,8 @@ class SQLitePool(Pool):
             throw(IOError, "Database file is not found: %r" % filename)
         pool.con = con = sqlite.connect(filename, isolation_level=None)
         con.text_factory = _text_factory
+        if pool.row_factory:
+            con.row_factory = pool.row_factory
         con.create_function('power', 2, pow)
         con.create_function('rand', 0, random)
         con.create_function('py_upper', 1, py_upper)

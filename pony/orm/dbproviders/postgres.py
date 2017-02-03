@@ -236,7 +236,7 @@ class PGProvider(DBAPIProvider):
                     'WHERE schemaname = %s AND tablename = %s AND lower(indexname) = lower(%s)'
         cursor.execute(sql, [ schema_name, table_name, index_name ])
         row = cursor.fetchone()
-        return row[0] if row is not None else None
+        return row
 
     def fk_exists(provider, connection, table_name, fk_name, case_sensitive=True):
         schema_name, table_name = provider.split_table_name(table_name)
@@ -253,7 +253,7 @@ class PGProvider(DBAPIProvider):
         cursor = connection.cursor()
         cursor.execute(sql, [ schema_name, table_name, fk_name ])
         row = cursor.fetchone()
-        return row[0] if row is not None else None
+        return row
 
     def table_has_data(provider, connection, table_name):
         table_name = provider.quote_name(table_name)
