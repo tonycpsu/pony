@@ -31,11 +31,11 @@ class Param(object):
         if j is not None:
             assert type(type(value)).__name__ == 'EntityMeta'
             value = value._get_raw_pkval_()[j]
-        if value is not None:  # can value be None at all?
-            converter = param.converter
-            if converter is not None:
-                if not param.optimistic: value = converter.val2dbval(value)
-                value = converter.py2sql(value)
+        converter = param.converter
+        if value is not None and converter is not None:
+            if converter.attr is None:
+                value = converter.val2dbval(value)
+            value = converter.py2sql(value)
         return value
     def __unicode__(param):
         paramstyle = param.style
@@ -400,6 +400,15 @@ class SQLBuilder(object):
     DIV = make_binary_op(' / ', True)
     FLOORDIV = make_binary_op(' / ', True)
 
+    def MOD(builder, a, b):
+        symbol = ' %% ' if builder.paramstyle in ('format', 'pyformat') else ' % '
+        return '(', builder(a), symbol, builder(b), ')'
+    def FLOAT_EQ(builder, a, b):
+        a, b = builder(a), builder(b)
+        return 'abs(', a, ' - ', b, ') / coalesce(nullif(greatest(abs(', a, '), abs(', b, ')), 0), 1) <= 1e-14'
+    def FLOAT_NE(builder, a, b):
+        a, b = builder(a), builder(b)
+        return 'abs(', a, ' - ', b, ') / coalesce(nullif(greatest(abs(', a, '), abs(', b, ')), 0), 1) > 1e-14'
     def CONCAT(builder, *args):
         return '(',  join(' || ', imap(builder, args)), ')'
     def NEG(builder, expr):
@@ -549,7 +558,7 @@ class SQLBuilder(object):
         empty_slice = slice(None, None, None)
         for value in values:
             if isinstance(value, int): append('[%d]' % value)
-            elif isinstance(value, str):
+            elif isinstance(value, basestring):
                 append('.' + value if is_ident(value) else '."%s"' % value.replace('"', '\\"'))
             elif value is Ellipsis: append('.*')
             elif value == empty_slice: append('[*]')

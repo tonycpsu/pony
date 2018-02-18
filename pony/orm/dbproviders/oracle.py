@@ -214,6 +214,8 @@ class OraBuilder(SQLBuilder):
         return 'TRUNC(', builder(expr), ')'
     def RANDOM(builder):
         return 'dbms_random.value'
+    def MOD(builder, a, b):
+        return 'MOD(', builder(a), ', ', builder(b), ')'
     def DATE_ADD(builder, expr, delta):
         if isinstance(delta, timedelta):
             return '(', builder(expr), " + INTERVAL '", timedelta2str(delta), "' HOUR TO SECOND)"
@@ -287,7 +289,7 @@ class OraBoolConverter(dbapiprovider.BoolConverter):
         return "NUMBER(1)"
 
 class OraStrConverter(dbapiprovider.StrConverter):
-    def validate(converter, val):
+    def validate(converter, val, obj=None):
         if val == '': return None
         return dbapiprovider.StrConverter.validate(converter, val)
     def sql2py(converter, val):
@@ -440,7 +442,7 @@ class OraProvider(DBAPIProvider):
         if db_session is not None and db_session.serializable:
             cursor = connection.cursor()
             sql = 'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE'
-            if core.debug: log_orm(sql)
+            if core.local.debug: log_orm(sql)
             cursor.execute(sql)
         cache.immediate = True
         if db_session is not None and (db_session.serializable or db_session.ddl):
@@ -475,12 +477,16 @@ class OraProvider(DBAPIProvider):
         elif len(args) == 2: user, password = args
         elif len(args) == 3: user, password, dsn = args
         elif args: throw(ValueError, 'Invalid number of positional arguments')
-        if user != kwargs.setdefault('user', user):
-            throw(ValueError, 'Ambiguous value for user')
-        if password != kwargs.setdefault('password', password):
-            throw(ValueError, 'Ambiguous value for password')
-        if dsn != kwargs.setdefault('dsn', dsn):
-            throw(ValueError, 'Ambiguous value for dsn')
+
+        def setdefault(kwargs, key, value):
+            kwargs_value = kwargs.setdefault(key, value)
+            if value is not None and value != kwargs_value:
+                throw(ValueError, 'Ambiguous value for ' + key)
+
+        setdefault(kwargs, 'user', user)
+        setdefault(kwargs, 'password', password)
+        setdefault(kwargs, 'dsn', dsn)
+
         kwargs.setdefault('threaded', True)
         kwargs.setdefault('min', 1)
         kwargs.setdefault('max', 10)
@@ -566,7 +572,7 @@ class OraPool(object):
             pool.forked_pools.append((pool.cx_pool, pool.pid))
             pool.cx_pool = cx_Oracle.SessionPool(**pool.kwargs)
             pool.pid = os.getpid()
-        if core.debug: log_orm('GET CONNECTION')
+        if core.local.debug: log_orm('GET CONNECTION')
         con = pool.cx_pool.acquire()
         con.outputtypehandler = output_type_handler
         return con

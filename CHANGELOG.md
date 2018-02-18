@@ -1,3 +1,68 @@
+# Pony ORM Release 0.7.3 (2017-10-23)
+
+## New features
+
+* `where()` method added to query
+* `coalesce()` function added
+* `between(x, a, b)` function added
+* #295: Add `_table_options_` for entity class to specify engine, tablespace, etc.
+* Make debug flag thread-local
+* `sql_debugging` context manager added
+* `sql_debug` and show_values arguments to db_session added
+* `set_sql_debug` function added as alias to (to be deprecated) `sql_debug` function
+* Allow `db_session` to accept `ddl` parameter when used as context manager
+* Add `optimistic=True` option to db_session
+* Skip optimistic checks for queries in `db_session` with `serializable=True`
+* `fk_name` option added for attributes in order to specify foreign key name
+* #280: Now it's possible to specify `timeout` option, as well as pass other keyword arguments for `sqlite3.connect` function
+* Add support of explicit casting to int in queries using `int()` function
+* Added modulo division % native support in queries
+
+## Bugfixes
+
+* Fix bugs with composite table names
+* Fix invalid foreign key & index names for tables which names include schema name
+* For queries like `select(x for x in MyObject if not x.description)` add "OR x.info IS NULL" for nullable string columns
+* Add optimistic checking for `delete()` method
+* Show updated attributes when `OptimisticCheckError` is being raised
+* Fix incorrect aliases in nested queries
+* Correctly pass exception from user-defined functions in SQLite
+* More clear error messages for `UnrepeatableReadError`
+* Fix `db_session(strict=True)` which was broken in 2d3afb24
+* Fixes #170: Problem with a primary key column used as a part of another key
+* Fixes #223: incorrect result of `getattr(entity, attrname)` when the same lambda applies to different entities
+* Fixes #266: Add handler to `"pony.orm"` logger does not work
+* Fixes #278: Cascade delete error: FOREIGN KEY constraint failed, with complex entity relationships
+* Fixes #283: Lost Json update immediately after object creation
+* Fixes #284: `query.order_by()` orders Json numbers like strings
+* Fixes #288: Expression text parsing issue in Python 3
+* Fixes #293: translation of if-expressions in expression 
+* Fixes #294: Real stack traces swallowed within IPython shell
+* `Collection.count()` method should check if session is alive
+* Set `obj._session_cache_` to None after exiting from db session for better garbage collection
+* Unload collections which are not fully loaded after exiting from db session for better garbage collection
+* Raise on unknown options for attributes that are part of relationship
+
+
+# Pony ORM Release 0.7.2 (2017-07-17)
+
+## New features
+
+* All arguments of db.bind() can be specified as keyword arguments. Previously Pony required the first positional argument which specified the database provider. Now you can pass all the database parameters using the dict: db.bind(**db_params). See https://docs.ponyorm.com/api_reference.html#Database.bind
+* The `optimistic` attribute option is added https://docs.ponyorm.com/api_reference.html#cmdoption-arg-optimistic
+
+## Bugfixes
+
+* Fixes #219: when a database driver raises an error, sometimes this error was masked by the 'RollbackException: InterfaceError: connection already closed' exception. This happened because on error, Pony tried to rollback transaction, but the connection to the database was already closed and it masked the initial error. Now Pony displays the original error which helps to understand the cause of the problem.
+* Fixes #276: Memory leak
+* Fixes the __all__ declaration. Previously IDEs, such as PyCharm, could not understand what is going to be imported by 'from pony.orm import *'. Now it works fine.
+* Fixes #232: negate check for numeric expressions now checks if value is zero or NULL
+* Fixes #238, fixes #133: raise TransactionIntegrityError exception instead of AssertionError if obj.collection.create(**kwargs) creates a duplicate object
+* Fixes #221: issue with unicode json path keys
+* Fixes bug when discriminator column is used as a part of a primary key
+* Handle situation when SQLite blob column contains non-binary value
+
+
 # Pony ORM Release 0.7.1 (2017-01-10)
 
 ## New features

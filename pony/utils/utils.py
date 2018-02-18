@@ -1,7 +1,7 @@
 from __future__ import absolute_import, print_function
-from pony.py23compat import PY2, imap, basestring, unicode
+from pony.py23compat import PY2, imap, basestring, unicode, pickle
 
-import re, os.path, sys, inspect, types, warnings
+import io, re, os.path, sys, inspect, types, warnings
 
 from datetime import datetime
 from itertools import count as _count
@@ -61,6 +61,7 @@ def cut_traceback(func, *args, **kwargs):
     except AssertionError: raise
     except Exception:
         exc_type, exc, tb = sys.exc_info()
+        full_tb = tb
         last_pony_tb = None
         try:
             while tb.tb_next:
@@ -70,11 +71,12 @@ def cut_traceback(func, *args, **kwargs):
                     last_pony_tb = tb
                 tb = tb.tb_next
             if last_pony_tb is None: raise
-            if tb.tb_frame.f_globals.get('__name__') == 'pony.utils' and tb.tb_frame.f_code.co_name == 'throw':
+            module_name = tb.tb_frame.f_globals.get('__name__') or ''
+            if module_name.startswith('pony.utils') and tb.tb_frame.f_code.co_name == 'throw':
                 reraise(exc_type, exc, last_pony_tb)
-            raise exc  # Set "pony.options.CUT_TRACEBACK = False" to see full traceback
+            reraise(exc_type, exc, full_tb)
         finally:
-            del exc, tb, last_pony_tb
+            del exc, full_tb, tb, last_pony_tb
 
 if PY2:
     exec('''def reraise(exc_type, exc, tb):
@@ -102,11 +104,27 @@ def truncate_repr(s, max_len=100):
     s = repr(s)
     return s if len(s) <= max_len else s[:max_len-3] + '...'
 
+codeobjects = {}
+
+def get_codeobject_id(codeobject):
+    codeobject_id = id(codeobject)
+    if codeobject_id not in codeobjects:
+        codeobjects[codeobject_id] = codeobject
+    return codeobject_id
+
 lambda_args_cache = {}
 
 def get_lambda_args(func):
-    names = lambda_args_cache.get(func)
+    if type(func) is types.FunctionType:
+        codeobject = func.func_code if PY2 else func.__code__
+        cache_key = get_codeobject_id(codeobject)
+    elif isinstance(func, ast.Lambda):
+        cache_key = func
+    else: assert False  # pragma: no cover
+
+    names = lambda_args_cache.get(cache_key)
     if names is not None: return names
+
     if type(func) is types.FunctionType:
         if hasattr(inspect, 'signature'):
             names, argsname, kwname, defaults = [], None, None, None
@@ -138,7 +156,8 @@ def get_lambda_args(func):
     if argsname: throw(TypeError, '*%s is not supported' % argsname)
     if kwname: throw(TypeError, '**%s is not supported' % kwname)
     if defaults: throw(TypeError, 'Defaults are not supported')
-    lambda_args_cache[func] = names
+
+    lambda_args_cache[cache_key] = names
     return names
 
 def error_method(*args, **kwargs):
@@ -324,6 +343,12 @@ def avg(iter):
     if not count: return None
     return sum / count
 
+def coalesce(*args):
+    for arg in args:
+        if arg is not None:
+            return arg
+    return None
+
 def distinct(iter):
     d = defaultdict(int)
     for item in iter:
@@ -333,5 +358,33 @@ def distinct(iter):
 def concat(*args):
     return ''.join(tostring(arg) for arg in args)
 
+def between(x, a, b):
+    return a <= x <= b
+
 def is_utf8(encoding):
     return encoding.upper().replace('_', '').replace('-', '') in ('UTF8', 'UTF', 'U8')
+
+def _persistent_id(obj):
+    if obj is Ellipsis:
+        return "Ellipsis"
+
+def _persistent_load(persid):
+    if persid == "Ellipsis":
+        return Ellipsis
+    raise pickle.UnpicklingError("unsupported persistent object")
+
+def pickle_ast(val):
+    pickled = io.BytesIO()
+    pickler = pickle.Pickler(pickled)
+    pickler.persistent_id = _persistent_id
+    pickler.dump(val)
+    return pickled
+
+def unpickle_ast(pickled):
+    pickled.seek(0)
+    unpickler = pickle.Unpickler(pickled)
+    unpickler.persistent_load = _persistent_load
+    return unpickler.load()
+
+def copy_ast(tree):
+    return unpickle_ast(pickle_ast(tree))

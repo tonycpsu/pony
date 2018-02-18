@@ -21,7 +21,7 @@ except ImportError:
     try:
         import pymysql as mysql_module
     except ImportError:
-        raise ImportError('No module named MySQLdb or pymysql found')
+        raise ImportError('In order to use PonyORM with MySQL please install MySQLdb or pymysql')
     from pymysql.converters import escape_str as string_literal
     import pymysql.converters as mysql_converters
     from pymysql.constants import FIELD_TYPE, FLAG, CLIENT
@@ -60,6 +60,8 @@ class MySQLBuilder(SQLBuilder):
     def RTRIM(builder, expr, chars=None):
         if chars is None: return 'rtrim(', builder(expr), ')'
         return 'trim(trailing ', builder(chars), ' from ' ,builder(expr), ')'
+    def TO_INT(builder, expr):
+        return 'CAST(', builder(expr), ' AS SIGNED)'
     def YEAR(builder, expr):
         return 'year(', builder(expr), ')'
     def MONTH(builder, expr):
@@ -103,9 +105,9 @@ class MySQLBuilder(SQLBuilder):
         return 'COALESCE(CAST(', builder(expr), ''' as CHAR), 'null') NOT IN ('null', 'false', '0', '""', '[]', '{}')'''
     def JSON_ARRAY_LENGTH(builder, value):
         return 'json_length(', builder(value), ')'
-    def EQ_JSON(builder, left, right):
+    def JSON_EQ(builder, left, right):
         return '(', builder(left), ' = CAST(', builder(right), ' AS JSON))'
-    def NE_JSON(builder, left, right):
+    def JSON_NE(builder, left, right):
         return '(', builder(left), ' != CAST(', builder(right), ' AS JSON))'
     def JSON_CONTAINS(builder, expr, path, key):
         key_sql = builder(key)
@@ -163,7 +165,8 @@ class MySQLUuidConverter(dbapiprovider.UuidConverter):
         return 'BINARY(16)'
 
 class MySQLJsonConverter(dbapiprovider.JsonConverter):
-    EQ = 'EQ_JSON'
+    EQ = 'JSON_EQ'
+    NE = 'JSON_NE'
     def init(self, kwargs):
         if self.provider.server_version < (5, 7, 8):
             version = '.'.join(imap(str, self.provider.server_version))
@@ -258,7 +261,7 @@ class MySQLProvider(DBAPIProvider):
             if fk is not None: fk = (fk[1] == 'ON')
             if fk:
                 sql = 'SET foreign_key_checks = 0'
-                if core.debug: log_orm(sql)
+                if core.local.debug: log_orm(sql)
                 cursor.execute(sql)
             cache.saved_fk_state = bool(fk)
             cache.in_transaction = True
@@ -266,7 +269,7 @@ class MySQLProvider(DBAPIProvider):
         if db_session is not None and db_session.serializable:
             cursor = connection.cursor()
             sql = 'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE'
-            if core.debug: log_orm(sql)
+            if core.local.debug: log_orm(sql)
             cursor.execute(sql)
             cache.in_transaction = True
 
@@ -278,7 +281,7 @@ class MySQLProvider(DBAPIProvider):
                 try:
                     cursor = connection.cursor()
                     sql = 'SET foreign_key_checks = 1'
-                    if core.debug: log_orm(sql)
+                    if core.local.debug: log_orm(sql)
                     cursor.execute(sql)
                 except:
                     provider.pool.drop(connection)
@@ -326,4 +329,7 @@ provider_cls = MySQLProvider
 def str2datetime(s):
     if 19 < len(s) < 26: s += '000000'[:26-len(s)]
     s = s.replace('-', ' ').replace(':', ' ').replace('.', ' ').replace('T', ' ')
-    return datetime(*imap(int, s.split()))
+    try:
+        return datetime(*imap(int, s.split()))
+    except ValueError:
+        return None  # for incorrect values like 0000-00-00 00:00:00

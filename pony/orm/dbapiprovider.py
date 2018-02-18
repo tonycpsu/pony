@@ -45,12 +45,20 @@ class     NotSupportedError(DatabaseError): pass
 @decorator
 def wrap_dbapi_exceptions(func, provider, *args, **kwargs):
     dbapi_module = provider.dbapi_module
-    try: return func(provider, *args, **kwargs)
+    try:
+        if provider.dialect != 'SQLite':
+            return func(provider, *args, **kwargs)
+        else:
+            provider.local_exceptions.keep_traceback = True
+            try: return func(provider, *args, **kwargs)
+            finally: provider.local_exceptions.keep_traceback = False
     except dbapi_module.NotSupportedError as e: raise NotSupportedError(e)
     except dbapi_module.ProgrammingError as e: raise ProgrammingError(e)
     except dbapi_module.InternalError as e: raise InternalError(e)
     except dbapi_module.IntegrityError as e: raise IntegrityError(e)
-    except dbapi_module.OperationalError as e: raise OperationalError(e)
+    except dbapi_module.OperationalError as e:
+        if provider.dialect == 'SQLite': provider.restore_exception()
+        raise OperationalError(e)
     except dbapi_module.DataError as e: raise DataError(e)
     except dbapi_module.DatabaseError as e: raise DatabaseError(e)
     except dbapi_module.InterfaceError as e:
@@ -150,12 +158,12 @@ class DBAPIProvider(object):
             if is_unique: template = 'unq_%(tname)s__%(cnames)s'
             elif m2m: template = 'idx_%(tname)s'
             else: template = 'idx_%(tname)s__%(cnames)s'
-            index_name = template % dict(tname=table_name,
+            index_name = template % dict(tname=provider.base_name(table_name),
                                          cnames='_'.join(name for name in column_names))
         return provider.normalize_name(index_name.lower())
 
     def get_default_fk_name(provider, child_table_name, parent_table_name, child_column_names):
-        fk_name = 'fk_%s__%s' % (child_table_name, '__'.join(child_column_names))
+        fk_name = 'fk_%s__%s' % (provider.base_name(child_table_name), '__'.join(child_column_names))
         return provider.normalize_name(fk_name.lower())
 
     def split_table_name(provider, table_name):
@@ -168,6 +176,13 @@ class DBAPIProvider(object):
                              % (provider.dialect, provider.name_before_table,
                                 size, 's' if size != 1 else '', table_name))
         return table_name[0], table_name[1]
+
+    def base_name(provider, name):
+        if not isinstance(name, basestring):
+            assert type(name) is tuple
+            name = name[-1]
+            assert isinstance(name, basestring)
+        return name
 
     def quote_name(provider, name):
         quote_char = provider.quote_char
@@ -197,14 +212,14 @@ class DBAPIProvider(object):
     @wrap_dbapi_exceptions
     def commit(provider, connection, cache=None):
         core = pony.orm.core
-        if core.debug: core.log_orm('COMMIT')
+        if core.local.debug: core.log_orm('COMMIT')
         connection.commit()
         if cache is not None: cache.in_transaction = False
 
     @wrap_dbapi_exceptions
     def rollback(provider, connection, cache=None):
         core = pony.orm.core
-        if core.debug: core.log_orm('ROLLBACK')
+        if core.local.debug: core.log_orm('ROLLBACK')
         connection.rollback()
         if cache is not None: cache.in_transaction = False
 
@@ -214,20 +229,20 @@ class DBAPIProvider(object):
         if cache is not None and cache.db_session is not None and cache.db_session.ddl:
             provider.drop(connection, cache)
         else:
-            if core.debug: core.log_orm('RELEASE CONNECTION')
+            if core.local.debug: core.log_orm('RELEASE CONNECTION')
             provider.pool.release(connection)
 
     @wrap_dbapi_exceptions
     def drop(provider, connection, cache=None):
         core = pony.orm.core
-        if core.debug: core.log_orm('CLOSE CONNECTION')
+        if core.local.debug: core.log_orm('CLOSE CONNECTION')
         provider.pool.drop(connection)
         if cache is not None: cache.in_transaction = False
 
     @wrap_dbapi_exceptions
     def disconnect(provider):
         core = pony.orm.core
-        if core.debug: core.log_orm('DISCONNECT')
+        if core.local.debug: core.log_orm('DISCONNECT')
         provider.pool.disconnect()
 
     @wrap_dbapi_exceptions
@@ -303,10 +318,10 @@ class Pool(localbase):
             pool.con = pool.pid = None
         core = pony.orm.core
         if pool.con is None:
-            if core.debug: core.log_orm('GET NEW CONNECTION')
+            if core.local.debug: core.log_orm('GET NEW CONNECTION')
             pool._connect()
             pool.pid = pid
-        elif core.debug: core.log_orm('GET CONNECTION FROM THE LOCAL POOL')
+        elif core.local.debug: core.log_orm('GET CONNECTION FROM THE LOCAL POOL')
         return pool.con
     def _connect(pool):
         pool.con = pool.dbapi_module.connect(*pool.args, **pool.kwargs)
@@ -342,7 +357,7 @@ class Converter(object):
     def init(converter, kwargs):
         attr = converter.attr
         if attr and attr.args: unexpected_args(attr, attr.args)
-    def validate(converter, val):
+    def validate(converter, val, obj=None):
         return val
     def py2sql(converter, val):
         return val
@@ -385,7 +400,7 @@ class NoneConverter(Converter):  # used for raw_sql() parameters only
         assert False
 
 class BoolConverter(Converter):
-    def validate(converter, val):
+    def validate(converter, val, obj=None):
         return bool(val)
     def sql2py(converter, val):
         return bool(val)
@@ -399,9 +414,12 @@ class StrConverter(Converter):
         Converter.__init__(converter, provider, py_type, attr)
     def init(converter, kwargs):
         attr = converter.attr
-        if not attr.args: max_len = None
-        elif len(attr.args) > 1: unexpected_args(attr, attr.args[1:])
-        else: max_len = attr.args[0]
+        max_len = kwargs.pop('max_len', None)
+        if len(attr.args) > 1: unexpected_args(attr, attr.args[1:])
+        elif attr.args:
+            if max_len is not None: throw(TypeError,
+                'Max length option specified twice: as a positional argument and as a `max_len` named argument')
+            max_len = attr.args[0]
         if issubclass(attr.py_type, (LongStr, LongUnicode)):
             if max_len is not None: throw(TypeError, 'Max length is not supported for CLOBs')
         elif max_len is None: max_len = converter.provider.varchar_default_max_len
@@ -410,7 +428,7 @@ class StrConverter(Converter):
         converter.max_len = max_len
         converter.db_encoding = kwargs.pop('db_encoding', None)
         converter.autostrip = kwargs.pop('autostrip', True)
-    def validate(converter, val):
+    def validate(converter, val, obj=None):
         if PY2 and isinstance(val, str): val = val.decode('ascii')
         elif not isinstance(val, unicode): throw(TypeError,
             'Value type for attribute %s must be %s. Got: %r' % (converter.attr, unicode.__name__, type(val)))
@@ -481,7 +499,7 @@ class IntConverter(Converter):
         converter.max_val = max_val or highest
         converter.size = size
         converter.unsigned = unsigned
-    def validate(converter, val):
+    def validate(converter, val, obj=None):
         if isinstance(val, int_types): pass
         elif isinstance(val, basestring):
             try: val = int(val)
@@ -506,10 +524,13 @@ class IntConverter(Converter):
         return converter.unsigned_types.get(converter.size)
 
 class RealConverter(Converter):
+    EQ = 'FLOAT_EQ'
+    NE = 'FLOAT_NE'
     # The tolerance is necessary for Oracle, because it has different representation of float numbers.
     # For other databases the default tolerance is set because the precision can be lost during
     # Python -> JavaScript -> Python conversion
     default_tolerance = 1e-14
+    optimistic = False
     def init(converter, kwargs):
         Converter.init(converter, kwargs)
         min_val = kwargs.pop('min', None)
@@ -525,7 +546,7 @@ class RealConverter(Converter):
         converter.min_val = min_val
         converter.max_val = max_val
         converter.tolerance = kwargs.pop('tolerance', converter.default_tolerance)
-    def validate(converter, val):
+    def validate(converter, val, obj=None):
         try: val = float(val)
         except ValueError:
             throw(TypeError, 'Invalid value for attribute %s: %r' % (converter.attr, val))
@@ -590,7 +611,7 @@ class DecimalConverter(Converter):
 
         converter.min_val = min_val
         converter.max_val = max_val
-    def validate(converter, val):
+    def validate(converter, val, obj=None):
         if isinstance(val, float):
             s = str(val)
             if float(s) != val: s = repr(val)
@@ -611,18 +632,20 @@ class DecimalConverter(Converter):
         return 'DECIMAL(%d, %d)' % (converter.precision, converter.scale)
 
 class BlobConverter(Converter):
-    def validate(converter, val):
+    def validate(converter, val, obj=None):
         if isinstance(val, buffer): return val
         if isinstance(val, str): return buffer(val)
         throw(TypeError, "Attribute %r: expected type is 'buffer'. Got: %r" % (converter.attr, type(val)))
     def sql2py(converter, val):
-        if not isinstance(val, buffer): val = buffer(val)
+        if not isinstance(val, buffer):
+            try: val = buffer(val)
+            except: pass
         return val
     def sql_type(converter):
         return 'BLOB'
 
 class DateConverter(Converter):
-    def validate(converter, val):
+    def validate(converter, val, obj=None):
         if isinstance(val, datetime): return val.date()
         if isinstance(val, date): return val
         if isinstance(val, basestring): return str2date(val)
@@ -672,7 +695,7 @@ class ConverterWithMicroseconds(Converter):
 
 class TimeConverter(ConverterWithMicroseconds):
     sql_type_name = 'TIME'
-    def validate(converter, val):
+    def validate(converter, val, obj=None):
         if isinstance(val, time): pass
         elif isinstance(val, basestring): val = str2time(val)
         else: throw(TypeError, "Attribute %r: expected type is 'time'. Got: %r" % (converter.attr, val))
@@ -686,7 +709,7 @@ class TimeConverter(ConverterWithMicroseconds):
 
 class TimedeltaConverter(ConverterWithMicroseconds):
     sql_type_name = 'INTERVAL'
-    def validate(converter, val):
+    def validate(converter, val, obj=None):
         if isinstance(val, timedelta): pass
         elif isinstance(val, basestring): val = str2timedelta(val)
         else: throw(TypeError, "Attribute %r: expected type is 'timedelta'. Got: %r" % (converter.attr, val))
@@ -700,7 +723,7 @@ class TimedeltaConverter(ConverterWithMicroseconds):
 
 class DatetimeConverter(ConverterWithMicroseconds):
     sql_type_name = 'DATETIME'
-    def validate(converter, val):
+    def validate(converter, val, obj=None):
         if isinstance(val, datetime): pass
         elif isinstance(val, basestring): val = str2datetime(val)
         else: throw(TypeError, "Attribute %r: expected type is 'datetime'. Got: %r" % (converter.attr, val))
@@ -718,7 +741,7 @@ class UuidConverter(Converter):
             attr.auto = False
             if not attr.default: attr.default = uuid4
         Converter.__init__(converter, provider, py_type, attr)
-    def validate(converter, val):
+    def validate(converter, val, obj=None):
         if isinstance(val, UUID): return val
         if isinstance(val, buffer): return UUID(bytes=val)
         if isinstance(val, basestring):
@@ -738,22 +761,29 @@ class UuidConverter(Converter):
 class JsonConverter(Converter):
     json_kwargs = {}
     class JsonEncoder(json.JSONEncoder):
-        def default(self, obj):
+        def default(converter, obj):
             if isinstance(obj, Json):
                 return obj.wrapped
-            return json.JSONEncoder.default(self, obj)
-    def val2dbval(self, val, obj=None):
-        return json.dumps(val, cls=self.JsonEncoder, **self.json_kwargs)
-    def dbval2val(self, dbval, obj=None):
+            return json.JSONEncoder.default(converter, obj)
+    def validate(converter, val, obj=None):
+        if obj is None or converter.attr is None:
+            return val
+        if isinstance(val, TrackedValue) and val.obj_ref() is obj and val.attr is converter.attr:
+            return val
+        return TrackedValue.make(obj, converter.attr, val)
+    def val2dbval(converter, val, obj=None):
+        return json.dumps(val, cls=converter.JsonEncoder, **converter.json_kwargs)
+    def dbval2val(converter, dbval, obj=None):
         if isinstance(dbval, (int, bool, float, type(None))):
             return dbval
         val = json.loads(dbval)
         if obj is None:
             return val
-        return TrackedValue.make(obj, self.attr, val)
-    def dbvals_equal(self, x, y):
+        return TrackedValue.make(obj, converter.attr, val)
+    def dbvals_equal(converter, x, y):
+        if x == y: return True  # optimization
         if isinstance(x, basestring): x = json.loads(x)
         if isinstance(y, basestring): y = json.loads(y)
         return x == y
-    def sql_type(self):
+    def sql_type(converter):
         return "JSON"

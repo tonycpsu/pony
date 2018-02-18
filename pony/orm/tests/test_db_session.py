@@ -12,7 +12,7 @@ class TestDBSession(unittest.TestCase):
     def setUp(self):
         self.db = Database('sqlite', ':memory:')
         class X(self.db.Entity):
-            a = Required(int)
+            a = PrimaryKey(int)
             b = Optional(int)
         self.X = X
         self.db.generate_mapping(create_tables=True)
@@ -90,19 +90,47 @@ class TestDBSession(unittest.TestCase):
         else:
             self.fail()
 
+    def test_allowed_exceptions_1(self):
+        # allowed_exceptions may be callable, should commit if nonzero
+        @db_session(allowed_exceptions=lambda e: isinstance(e, ZeroDivisionError))
+        def test():
+            self.X(a=3, b=3)
+            1/0
+        try:
+            test()
+        except ZeroDivisionError:
+            with db_session:
+                self.assertEqual(count(x for x in self.X), 3)
+        else:
+            self.fail()
+
+    def test_allowed_exceptions_2(self):
+        # allowed_exceptions may be callable, should rollback if not nonzero
+        @db_session(allowed_exceptions=lambda e: isinstance(e, TypeError))
+        def test():
+            self.X(a=3, b=3)
+            1/0
+        try:
+            test()
+        except ZeroDivisionError:
+            with db_session:
+                self.assertEqual(count(x for x in self.X), 2)
+        else:
+            self.fail()
+
     @raises_exception(TypeError, "'retry' parameter of db_session must be of integer type. Got: %r" % str)
-    def test_db_session_decorator_5(self):
+    def test_retry_1(self):
         @db_session(retry='foobar')
         def test():
             pass
 
     @raises_exception(TypeError, "'retry' parameter of db_session must not be negative. Got: -1")
-    def test_db_session_decorator_6(self):
+    def test_retry_2(self):
         @db_session(retry=-1)
         def test():
             pass
 
-    def test_db_session_decorator_7(self):
+    def test_retry_3(self):
         # Should not to do retry until retry count is specified
         counter = count()
         @db_session(retry_exceptions=[ZeroDivisionError])
@@ -119,7 +147,7 @@ class TestDBSession(unittest.TestCase):
         else:
             self.fail()
 
-    def test_db_session_decorator_8(self):
+    def test_retry_4(self):
         # Should rollback & retry 1 time if retry=1
         counter = count()
         @db_session(retry=1, retry_exceptions=[ZeroDivisionError])
@@ -136,7 +164,7 @@ class TestDBSession(unittest.TestCase):
         else:
             self.fail()
 
-    def test_db_session_decorator_9(self):
+    def test_retry_5(self):
         # Should rollback & retry N time if retry=N
         counter = count()
         @db_session(retry=5, retry_exceptions=[ZeroDivisionError])
@@ -153,7 +181,7 @@ class TestDBSession(unittest.TestCase):
         else:
             self.fail()
 
-    def test_db_session_decorator_10(self):
+    def test_retry_6(self):
         # Should not retry if the exception not in the list of retry_exceptions
         counter = count()
         @db_session(retry=3, retry_exceptions=[TypeError])
@@ -170,7 +198,7 @@ class TestDBSession(unittest.TestCase):
         else:
             self.fail()
 
-    def test_db_session_decorator_11(self):
+    def test_retry_7(self):
         # Should commit after successful retrying
         counter = count()
         @db_session(retry=5, retry_exceptions=[ZeroDivisionError])
@@ -189,41 +217,13 @@ class TestDBSession(unittest.TestCase):
 
     @raises_exception(TypeError, "The same exception ZeroDivisionError cannot be specified "
                                  "in both allowed and retry exception lists simultaneously")
-    def test_db_session_decorator_12(self):
+    def test_retry_8(self):
         @db_session(retry=3, retry_exceptions=[ZeroDivisionError],
                              allowed_exceptions=[ZeroDivisionError])
         def test():
             pass
 
-    def test_db_session_decorator_13(self):
-        # allowed_exceptions may be callable, should commit if nonzero
-        @db_session(allowed_exceptions=lambda e: isinstance(e, ZeroDivisionError))
-        def test():
-            self.X(a=3, b=3)
-            1/0
-        try:
-            test()
-        except ZeroDivisionError:
-            with db_session:
-                self.assertEqual(count(x for x in self.X), 3)
-        else:
-            self.fail()
-
-    def test_db_session_decorator_14(self):
-        # allowed_exceptions may be callable, should rollback if not nonzero
-        @db_session(allowed_exceptions=lambda e: isinstance(e, TypeError))
-        def test():
-            self.X(a=3, b=3)
-            1/0
-        try:
-            test()
-        except ZeroDivisionError:
-            with db_session:
-                self.assertEqual(count(x for x in self.X), 2)
-        else:
-            self.fail()
-
-    def test_db_session_decorator_15(self):
+    def test_retry_9(self):
         # retry_exceptions may be callable, should retry if nonzero
         counter = count()
         @db_session(retry=3, retry_exceptions=lambda e: isinstance(e, ZeroDivisionError))
@@ -237,6 +237,20 @@ class TestDBSession(unittest.TestCase):
             self.assertEqual(next(counter), 4)
             with db_session:
                 self.assertEqual(count(x for x in self.X), 2)
+        else:
+            self.fail()
+
+    def test_retry_10(self):
+        # Issue 313: retry on exception raised during db_session.__exit__
+        retries = count()
+        @db_session(retry=3)
+        def test():
+            next(retries)
+            self.X(a=1, b=1)
+        try:
+            test()
+        except TransactionIntegrityError:
+            self.assertEqual(next(retries), 4)
         else:
             self.fail()
 
@@ -276,11 +290,28 @@ class TestDBSession(unittest.TestCase):
         else:
             self.fail()
 
-    @raises_exception(TypeError, "@db_session can accept 'ddl' parameter "
-                      "only when used as decorator and not as context manager")
+    # restriction removed in 0.7.3:
+    # @raises_exception(TypeError, "@db_session can accept 'ddl' parameter "
+    #                   "only when used as decorator and not as context manager")
     def test_db_session_ddl_1(self):
         with db_session(ddl=True):
             pass
+
+    def test_db_session_ddl_1a(self):
+        with db_session(ddl=True):
+              with db_session(ddl=True):
+                  pass
+
+    def test_db_session_ddl_1b(self):
+        with db_session(ddl=True):
+              with db_session:
+                  pass
+
+    @raises_exception(TransactionError, 'Cannot start ddl transaction inside non-ddl transaction')
+    def test_db_session_ddl_1c(self):
+        with db_session:
+              with db_session(ddl=True):
+                  pass
 
     @raises_exception(TransactionError, "test() cannot be called inside of db_session")
     def test_db_session_ddl_2(self):
@@ -379,7 +410,7 @@ class TestDBSessionScope(unittest.TestCase):
         group_id = s1.group.id
         major = s1.group.major
 
-    @raises_exception(DatabaseSessionIsOver, 'Cannot assign new value to attribute Student[1].name: the database session is over')
+    @raises_exception(DatabaseSessionIsOver, 'Cannot assign new value to Student[1].name: the database session is over')
     def test4(self):
         with db_session:
             s1 = Student[1]
@@ -396,28 +427,28 @@ class TestDBSessionScope(unittest.TestCase):
             g1 = Group[1]
         l = len(g1.students)
 
-    @raises_exception(DatabaseSessionIsOver, 'Cannot change collection Group[1].Group.students: the database session is over')
+    @raises_exception(DatabaseSessionIsOver, 'Cannot change collection Group[1].students: the database session is over')
     def test7(self):
         with db_session:
             s1 = Student[1]
             g1 = Group[1]
         g1.students.remove(s1)
 
-    @raises_exception(DatabaseSessionIsOver, 'Cannot change collection Group[1].Group.students: the database session is over')
+    @raises_exception(DatabaseSessionIsOver, 'Cannot change collection Group[1].students: the database session is over')
     def test8(self):
         with db_session:
             g2_students = Group[2].students
             g1 = Group[1]
         g1.students = g2_students
 
-    @raises_exception(DatabaseSessionIsOver, 'Cannot change collection Group[1].Group.students: the database session is over')
+    @raises_exception(DatabaseSessionIsOver, 'Cannot change collection Group[1].students: the database session is over')
     def test9(self):
         with db_session:
             s3 = Student[3]
             g1 = Group[1]
         g1.students.add(s3)
 
-    @raises_exception(DatabaseSessionIsOver, 'Cannot change collection Group[1].Group.students: the database session is over')
+    @raises_exception(DatabaseSessionIsOver, 'Cannot change collection Group[1].students: the database session is over')
     def test10(self):
         with db_session:
             g1 = Group[1]
@@ -434,6 +465,16 @@ class TestDBSessionScope(unittest.TestCase):
         with db_session:
             s1 = Student[1]
         s1.set(name='New name')
+
+    def test_db_session_strict_1(self):
+        with db_session(strict=True):
+            s1 = Student[1]
+
+    @raises_exception(DatabaseSessionIsOver, 'Cannot read value of Student[1].name: the database session is over')
+    def test_db_session_strict_2(self):
+        with db_session(strict=True):
+            s1 = Student[1]
+        name = s1.name
 
 if __name__ == '__main__':
     unittest.main()

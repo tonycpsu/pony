@@ -278,7 +278,10 @@ class TestJson(TestCase):
             p = get(p for p in self.Product)
             self.assertDictEqual(p.info['os'], {'type': 'iOS', 'version': '9'})
 
-    # JSON length
+    @db_session
+    def test_set_same_value(self):
+        p = get(p for p in self.Product)
+        p.info = p.info
 
     @db_session
     def test_len(self):
@@ -289,11 +292,14 @@ class TestJson(TestCase):
             val = select(len(p.info['colors']) for p in self.Product).first()
             self.assertEqual(val, 3)
 
-    # # Json equality
-
     @db_session
     def test_equal_str(self):
         p = get(p for p in self.Product if p.info['name'] == 'Apple iPad Air 2')
+        self.assertTrue(p)
+
+    @db_session
+    def test_unicode_key(self):
+        p = get(p for p in self.Product if p.info[u'name'] == 'Apple iPad Air 2')
         self.assertTrue(p)
 
     @db_session
@@ -638,3 +644,13 @@ class TestJson(TestCase):
         with db_session:
             val = select(p.info['id'] for p in Product if not p.info['val'])
             self.assertEqual(tuple(sorted(val)), (2, 3, 5, 7, 9, 11))
+
+    @db_session
+    def test_optimistic_check(self):
+        p1 = self.Product.select().first()
+        p1.info['foo'] = 'bar'
+        flush()
+        p1.name = 'name2'
+        flush()
+        p1.name = 'name3'
+        flush()
