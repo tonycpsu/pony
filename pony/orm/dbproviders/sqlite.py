@@ -520,6 +520,7 @@ class SQLitePool(Pool):
         pool.filename = filename
         pool.create_db = create_db
         pool.kwargs = kwargs
+        pool.row_factory = row_factory
         pool.con = None
 
     def _connect(pool):
