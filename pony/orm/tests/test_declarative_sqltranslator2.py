@@ -100,12 +100,12 @@ class TestSQLTranslator2(unittest.TestCase):
         self.assertEqual(q.count(), 7)
     def test_distinct3(self):
         q = select(d for d in Department if len(s for c in d.courses for s in c.students) > len(s for s in Student))
-        self.assertEqual("DISTINCT" in flatten(q._translator.conditions), True)
         self.assertEqual(q[:], [])
+        self.assertTrue('DISTINCT' in db.last_sql)
     def test_distinct4(self):
         q = select(d for d in Department if len(d.groups.students) > 3)
-        self.assertEqual("DISTINCT" not in flatten(q._translator.conditions), True)
         self.assertEqual(q[:], [Department[2]])
+        self.assertTrue("DISTINCT" not in db.last_sql)
     def test_distinct5(self):
         result = set(select(s for s in Student))
         self.assertEqual(result, {Student[1], Student[2], Student[3], Student[4], Student[5], Student[6], Student[7]})
@@ -177,7 +177,7 @@ class TestSQLTranslator2(unittest.TestCase):
          get(s for s in Student)
     def test_exists(self):
         result = exists(s for s in Student)
-    @raises_exception(ExprEvalError, "db.FooBar raises AttributeError: 'Database' object has no attribute 'FooBar'")
+    @raises_exception(ExprEvalError, "`db.FooBar` raises AttributeError: 'Database' object has no attribute 'FooBar'")
     def test_entity_not_found(self):
         select(s for s in db.Student for g in db.FooBar)
     def test_keyargs1(self):

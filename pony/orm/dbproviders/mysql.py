@@ -62,6 +62,10 @@ class MySQLBuilder(SQLBuilder):
         return 'trim(trailing ', builder(chars), ' from ' ,builder(expr), ')'
     def TO_INT(builder, expr):
         return 'CAST(', builder(expr), ' AS SIGNED)'
+    def TO_REAL(builder, expr):
+        return 'CAST(', builder(expr), ' AS DOUBLE)'
+    def TO_STR(builder, expr):
+        return 'CAST(', builder(expr), ' AS CHAR)'
     def YEAR(builder, expr):
         return 'year(', builder(expr), ')'
     def MONTH(builder, expr):
@@ -100,6 +104,8 @@ class MySQLBuilder(SQLBuilder):
             return 'NULLIF(', result, ", CAST('null' as JSON))"
         if type in (bool, int):
             return 'CAST(', result, ' AS SIGNED)'
+        if type is float:
+            return 'CAST(', result, ' AS DOUBLE)'
         return 'json_unquote(', result, ')'
     def JSON_NONZERO(builder, expr):
         return 'COALESCE(CAST(', builder(expr), ''' as CHAR), 'null') NOT IN ('null', 'false', '0', '""', '[]', '{}')'''
@@ -177,9 +183,9 @@ class MySQLProvider(DBAPIProvider):
     paramstyle = 'format'
     quote_char = "`"
     max_name_len = 64
+    max_params_count = 10000
     table_if_not_exists_syntax = True
     index_if_not_exists_syntax = False
-    select_for_update_nowait_syntax = False
     max_time_precision = default_time_precision = 0
     varchar_default_max_len = 255
     uint64_support = True

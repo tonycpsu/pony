@@ -1,7 +1,7 @@
 from __future__ import absolute_import, print_function, division
 from pony.py23compat import PY2, izip, xrange
 
-import sys, types
+import sys, types, inspect
 from opcode import opname as opnames, HAVE_ARGUMENT, EXTENDED_ARG, cmp_op
 from opcode import hasconst, hasname, hasjrel, haslocal, hascompare, hasfree
 
@@ -79,15 +79,19 @@ class Decompiler(object):
         co_code = code.co_code
         free = code.co_cellvars + code.co_freevars
         try:
-            extended_arg = 0
             while decompiler.pos < decompiler.end:
                 i = decompiler.pos
                 if i in decompiler.targets: decompiler.process_target(i)
                 op = ord(code.co_code[i])
                 if PY36:
-                    if op >= HAVE_ARGUMENT:
-                        oparg = ord(co_code[i + 1]) | extended_arg
-                        extended_arg = (arg << 8) if op == EXTENDED_ARG else 0
+                    extended_arg = 0
+                    oparg = ord(code.co_code[i+1])
+                    while op == EXTENDED_ARG:
+                        extended_arg = (extended_arg | oparg) << 8
+                        i += 2
+                        op = ord(code.co_code[i])
+                        oparg = ord(code.co_code[i+1])
+                    oparg = None if op < HAVE_ARGUMENT else oparg | extended_arg
                     i += 2
                 else:
                     i += 1
@@ -181,6 +185,10 @@ class Decompiler(object):
     def BUILD_TUPLE(decompiler, size):
         return ast.Tuple(decompiler.pop_items(size))
 
+    def BUILD_STRING(decompiler, count):
+        values = list(reversed([decompiler.stack.pop() for _ in range(count)]))
+        return ast.JoinedStr(values)
+
     def CALL_FUNCTION(decompiler, argc, star=None, star2=None):
         pop = decompiler.stack.pop
         kwarg, posarg = divmod(argc, 256)
@@ -234,6 +242,15 @@ class Decompiler(object):
         star = decompiler.stack.pop()
         return decompiler._call_function([], star, star2)
 
+    def CALL_METHOD(decompiler, argc):
+        pop = decompiler.stack.pop
+        args = []
+        for i in range(argc):
+            args.append(pop())
+        args.reverse()
+        method = pop()
+        return ast.CallFunc(method, args)
+
     def COMPARE_OP(decompiler, op):
         oper2 = decompiler.stack.pop()
         oper1 = decompiler.stack.pop()
@@ -247,6 +264,15 @@ class Decompiler(object):
         iter = decompiler.stack.pop()
         ifs = []
         return ast.GenExprFor(assign, iter, ifs)
+
+    def FORMAT_VALUE(decompiler, flags):
+        if flags in (0, 1, 2, 3):
+            value = decompiler.stack.pop()
+            return ast.Str(value, flags)
+        elif flags == 4:
+            fmt_spec = decompiler.stack.pop()
+            value = decompiler.stack.pop()
+            return ast.FormattedValue(value, fmt_spec)
 
     def GET_ITER(decompiler):
         pass
@@ -335,6 +361,11 @@ class Decompiler(object):
         decompiler.names.add(varname)
         return ast.Name(varname)
 
+    def LOAD_METHOD(decompiler, methname):
+        return decompiler.LOAD_ATTR(methname)
+
+    LOOKUP_METHOD = LOAD_METHOD  # For PyPy
+
     def LOAD_NAME(decompiler, varname):
         decompiler.names.add(varname)
         return ast.Name(varname)
@@ -345,24 +376,39 @@ class Decompiler(object):
         return decompiler.MAKE_FUNCTION(argc)
 
     def MAKE_FUNCTION(decompiler, argc):
+        defaults = []
+        flags = 0
         if sys.version_info >= (3, 6):
-            if argc:
-                if argc != 0x08: throw(NotImplementedError, argc)
             qualname = decompiler.stack.pop()
             tos = decompiler.stack.pop()
-            if (argc & 0x08): func_closure = decompiler.stack.pop()
+            if argc & 0x08:
+                func_closure = decompiler.stack.pop()
+            if argc & 0x04:
+                annotations = decompiler.stack.pop()
+            if argc & 0x02:
+                kwonly_defaults = decompiler.stack.pop()
+            if argc & 0x01:
+                defaults = decompiler.stack.pop()
+                throw(NotImplementedError)
         else:
-            if argc: throw(NotImplementedError)
+            if not PY2:
+                qualname = decompiler.stack.pop()
             tos = decompiler.stack.pop()
-            if not PY2: tos = decompiler.stack.pop()
+            if argc:
+                defaults = [ decompiler.stack.pop() for i in range(argc) ]
+                defaults.reverse()
         codeobject = tos.value
         func_decompiler = Decompiler(codeobject)
         # decompiler.names.update(decompiler.names)  ???
         if codeobject.co_varnames[:1] == ('.0',):
             return func_decompiler.ast  # generator
-        argnames = codeobject.co_varnames[:codeobject.co_argcount]
-        defaults = []  # todo
-        flags = 0  # todo
+        argnames, varargs, keywords = inspect.getargs(codeobject)
+        if varargs:
+            argnames.append(varargs)
+            flags |= inspect.CO_VARARGS
+        if keywords:
+            argnames.append(keywords)
+            flags |= inspect.CO_VARKEYWORDS
         return ast.Lambda(argnames, defaults, flags, func_decompiler.ast)
 
     POP_JUMP_IF_FALSE = JUMP_IF_FALSE

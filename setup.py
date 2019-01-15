@@ -1,7 +1,14 @@
 from __future__ import print_function
 
-from distutils.core import setup
+from setuptools import setup
 import sys
+
+import unittest
+
+def test_suite():
+    test_loader = unittest.TestLoader()
+    test_suite = test_loader.discover('pony.orm.tests', pattern='test_*.py')
+    return test_suite
 
 name = "pony"
 version = __import__('pony').__version__
@@ -64,6 +71,8 @@ classifiers = [
     'Programming Language :: Python :: 3.4',
     'Programming Language :: Python :: 3.5',
     'Programming Language :: Python :: 3.6',
+    'Programming Language :: Python :: 3.7',
+    'Programming Language :: Python :: Implementation :: PyPy',
     'Topic :: Software Development :: Libraries',
     'Topic :: Database'
 ]
@@ -75,6 +84,8 @@ licence = "Apache License Version 2.0"
 
 packages = [
     "pony",
+    "pony.flask",
+    "pony.flask.example",
     "pony.orm",
     "pony.orm.dbproviders",
     "pony.orm.examples",
@@ -85,12 +96,17 @@ packages = [
     "pony.utils"
 ]
 
+package_data = {
+    'pony.flask.example': ['templates/*.html'],
+    'pony.orm.tests': ['queries.txt']
+}
+
 download_url = "http://pypi.python.org/pypi/pony/"
 
 if __name__ == "__main__":
     pv = sys.version_info[:2]
-    if pv not in ((2, 7), (3, 3), (3, 4), (3, 5), (3, 6)):
-        s = "Sorry, but %s %s requires Python of one of the following versions: 2.7, 3.3-3.6." \
+    if pv not in ((2, 7), (3, 3), (3, 4), (3, 5), (3, 6), (3, 7)):
+        s = "Sorry, but %s %s requires Python of one of the following versions: 2.7, 3.3-3.7." \
             " You have version %s"
         print(s % (name, version, sys.version.split(' ', 1)[0]))
         sys.exit(1)
@@ -106,5 +122,7 @@ if __name__ == "__main__":
         url=url,
         license=licence,
         packages=packages,
-        download_url=download_url
+        package_data=package_data,
+        download_url=download_url,
+        test_suite='setup.test_suite'
     )

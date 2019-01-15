@@ -1,5 +1,5 @@
 from __future__ import absolute_import, print_function, division
-from pony.py23compat import PY2, izip, imap, itervalues, basestring, unicode, buffer
+from pony.py23compat import PY2, izip, imap, itervalues, basestring, unicode, buffer, int_types
 
 from operator import attrgetter
 from decimal import Decimal
@@ -23,11 +23,12 @@ class Param(object):
     def eval(param, values):
         varkey, i, j = param.paramkey
         value = values[varkey]
-        t = type(value)
         if i is not None:
+            t = type(value)
             if t is tuple: value = value[i]
             elif t is RawSQL: value = value.values[i]
-            else: assert False
+            elif hasattr(value, '_get_items'): value = value._get_items()[i]
+            else: assert False, t
         if j is not None:
             assert type(type(value)).__name__ == 'EntityMeta'
             value = value._get_raw_pkval_()[j]
@@ -162,6 +163,8 @@ class SQLBuilder(object):
     composite_param_class = CompositeParam
     value_class = Value
     indent_spaces = " " * 4
+    least_func_name = 'least'
+    greatest_func_name = 'greatest'
     def __init__(builder, provider, ast):
         builder.provider = provider
         builder.quote_name = provider.quote_name
@@ -233,7 +236,7 @@ class SQLBuilder(object):
             if alias is not None: builder.suppress_aliases = True
             if not where: return 'DELETE ', builder(from_ast)
             return 'DELETE ', builder(from_ast), builder(where)
-    def subquery(builder, *sections):
+    def _subquery(builder, *sections):
         builder.indent += 1
         if not builder.inner_join_syntax:
             sections = move_conditions_from_inner_join_to_where(sections)
@@ -244,19 +247,21 @@ class SQLBuilder(object):
         prev_suppress_aliases = builder.suppress_aliases
         builder.suppress_aliases = False
         try:
-            result = builder.subquery(*sections)
+            result = builder._subquery(*sections)
             if builder.indent:
                 indent = builder.indent_spaces * builder.indent
                 return '(\n', result, indent + ')'
             return result
         finally:
             builder.suppress_aliases = prev_suppress_aliases
-    def SELECT_FOR_UPDATE(builder, nowait, *sections):
+    def SELECT_FOR_UPDATE(builder, nowait, skip_locked, *sections):
         assert not builder.indent
         result = builder.SELECT(*sections)
-        return result, 'FOR UPDATE NOWAIT\n' if nowait else 'FOR UPDATE\n'
+        nowait = ' NOWAIT' if nowait else ''
+        skip_locked = ' SKIP LOCKED' if skip_locked else ''
+        return result, 'FOR UPDATE', nowait, skip_locked, '\n'
     def EXISTS(builder, *sections):
-        result = builder.subquery(*sections)
+        result = builder._subquery(*sections)
         indent = builder.indent_spaces * builder.indent
         return 'EXISTS (\n', indent, 'SELECT 1\n', result, indent, ')'
     def NOT_EXISTS(builder, *sections):
@@ -356,8 +361,15 @@ class SQLBuilder(object):
         return builder(expr), ' DESC'
     @indentable
     def LIMIT(builder, limit, offset=None):
-        if not offset: return 'LIMIT ', builder(limit), '\n'
-        else: return 'LIMIT ', builder(limit), ' OFFSET ', builder(offset), '\n'
+        if limit is None:
+            limit = 'null'
+        else:
+            assert isinstance(limit, int_types)
+        assert offset is None or isinstance(offset, int)
+        if offset:
+            return 'LIMIT %s OFFSET %d\n' % (limit, offset)
+        else:
+            return 'LIMIT %s\n' % limit
     def COLUMN(builder, table_alias, col_name):
         if builder.suppress_aliases or not table_alias:
             return [ '%s' % builder.quote_name(col_name) ]
@@ -373,6 +385,8 @@ class SQLBuilder(object):
         return param
     def make_composite_param(builder, paramkey, items, func):
         return builder.make_param(builder.composite_param_class, paramkey, items, func)
+    def STAR(builder, table_alias):
+        return builder.quote_name(table_alias), '.*'
     def ROW(builder, *items):
         return '(', join(', ', imap(builder, items)), ')'
     def VALUE(builder, value):
@@ -441,24 +455,33 @@ class SQLBuilder(object):
             return builder(expr1), ' NOT IN ', builder(x)
         expr_list = [ builder(expr) for expr in x ]
         return builder(expr1), ' NOT IN (', join(', ', expr_list), ')'
-    def COUNT(builder, kind, *expr_list):
-        if kind == 'ALL':
+    def COUNT(builder, distinct, *expr_list):
+        assert distinct in (None, True, False)
+        if not distinct:
             if not expr_list: return ['COUNT(*)']
             return 'COUNT(', join(', ', imap(builder, expr_list)), ')'
-        elif kind == 'DISTINCT':
-            if not expr_list: throw(AstError, 'COUNT(DISTINCT) without argument')
-            if len(expr_list) == 1: return 'COUNT(DISTINCT ', builder(expr_list[0]), ')'
-            if builder.dialect == 'PostgreSQL':
-                return 'COUNT(DISTINCT ', builder.ROW(*expr_list), ')'
-            elif builder.dialect == 'MySQL':
-                return 'COUNT(DISTINCT ', join(', ', imap(builder, expr_list)), ')'
-            # Oracle and SQLite queries translated to completely different subquery syntax
-            else: throw(NotImplementedError)  # This line must not be executed
-        throw(AstError, 'Invalid COUNT kind (must be ALL or DISTINCT)')
-    def SUM(builder, expr, distinct=False):
+        if not expr_list: throw(AstError, 'COUNT(DISTINCT) without argument')
+        if len(expr_list) == 1:
+            return 'COUNT(DISTINCT ', builder(expr_list[0]), ')'
+
+        if builder.dialect == 'PostgreSQL':
+            return 'COUNT(DISTINCT ', builder.ROW(*expr_list), ')'
+        elif builder.dialect == 'MySQL':
+            return 'COUNT(DISTINCT ', join(', ', imap(builder, expr_list)), ')'
+        # Oracle and SQLite queries translated to completely different subquery syntax
+        else: throw(NotImplementedError)  # This line must not be executed
+    def SUM(builder, distinct, expr):
+        assert distinct in (None, True, False)
         return distinct and 'coalesce(SUM(DISTINCT ' or 'coalesce(SUM(', builder(expr), '), 0)'
-    def AVG(builder, expr, distinct=False):
+    def AVG(builder, distinct, expr):
+        assert distinct in (None, True, False)
         return distinct and 'AVG(DISTINCT ' or 'AVG(', builder(expr), ')'
+    def GROUP_CONCAT(builder, distinct, expr, sep=None):
+        assert distinct in (None, True, False)
+        result = distinct and 'GROUP_CONCAT(DISTINCT ' or 'GROUP_CONCAT(', builder(expr)
+        if sep is not None:
+            result = result, ', ', builder(sep)
+        return result, ')'
     UPPER = make_unary_func('upper')
     LOWER = make_unary_func('lower')
     LENGTH = make_unary_func('length')
@@ -466,15 +489,17 @@ class SQLBuilder(object):
     def COALESCE(builder, *args):
         if len(args) < 2: assert False  # pragma: no cover
         return 'coalesce(', join(', ', imap(builder, args)), ')'
-    def MIN(builder, *args):
+    def MIN(builder, distinct, *args):
+        assert not distinct, distinct
         if len(args) == 0: assert False  # pragma: no cover
         elif len(args) == 1: fname = 'MIN'
-        else: fname = 'least'
+        else: fname = builder.least_func_name
         return fname, '(',  join(', ', imap(builder, args)), ')'
-    def MAX(builder, *args):
+    def MAX(builder, distinct, *args):
+        assert not distinct, distinct
         if len(args) == 0: assert False  # pragma: no cover
         elif len(args) == 1: fname = 'MAX'
-        else: fname = 'greatest'
+        else: fname = builder.greatest_func_name
         return fname, '(',  join(', ', imap(builder, args)), ')'
     def SUBSTR(builder, expr, start, len=None):
         if len is None: return 'substr(', builder(expr), ', ', builder(start), ')'
@@ -506,6 +531,10 @@ class SQLBuilder(object):
         return 'replace(', builder(str), ', ', builder(from_), ', ', builder(to), ')'
     def TO_INT(builder, expr):
         return 'CAST(', builder(expr), ' AS integer)'
+    def TO_STR(builder, expr):
+        return 'CAST(', builder(expr), ' AS text)'
+    def TO_REAL(builder, expr):
+        return 'CAST(', builder(expr), ' AS real)'
     def TODAY(builder):
         return 'CURRENT_DATE'
     def NOW(builder):
@@ -578,3 +607,15 @@ class SQLBuilder(object):
         throw(NotImplementedError)
     def JSON_PARAM(builder, expr):
         return builder(expr)
+    def ARRAY_INDEX(builder, col, index):
+        throw(NotImplementedError)
+    def ARRAY_CONTAINS(builder, key, not_in, col):
+        throw(NotImplementedError)
+    def ARRAY_SUBSET(builder, array1, not_in, array2):
+        throw(NotImplementedError)
+    def ARRAY_LENGTH(builder, array):
+        throw(NotImplementedError)
+    def ARRAY_SLICE(builder, array, start, stop):
+        throw(NotImplementedError)
+    def MAKE_ARRAY(builder, *items):
+        throw(NotImplementedError)

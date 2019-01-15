@@ -2,75 +2,66 @@ from pony.py23compat import basestring
 
 import unittest
 
-import click
-
 from pony.orm import *
 from pony.orm.tests.testutils import raises_exception, raises_if
 from pony.orm.ormtypes import Json, TrackedValue, TrackedList, TrackedDict
 
-from contextlib import contextmanager
-
-import pony.orm.tests.fixtures
-from ponytest import with_cli_args, TestCase
 
 
+class TestJson(unittest.TestCase):
 
-class TestJson(TestCase):
-
-    @classmethod
-    def make_entities(cls):
-        class Product(cls.db.Entity):
+    def setUp(self):
+        self.db = Database('sqlite', ':memory:')
+        class Product(self.db.Entity):
             name = Required(str)
             info = Optional(Json)
             tags = Optional(Json)
 
-        cls.Product = cls.db.Product
+        self.db.generate_mapping(create_tables=True)
 
+        self.Product = Product
 
-    @db_session
-    def setUp(self):
-        self.db.execute('delete from %s' % self.db.Product._table_)
-
-        self.Product(
-            name='Apple iPad Air 2',
-            info={
-                'name': 'Apple iPad Air 2',
-                'display': {
-                 'size': 9.7,
-                 'resolution': [2048, 1536],
-                 'matrix-type': 'IPS',
-                 'multi-touch': True
+        with db_session:
+            self.Product(
+                name='Apple iPad Air 2',
+                info={
+                    'name': 'Apple iPad Air 2',
+                    'display': {
+                     'size': 9.7,
+                     'resolution': [2048, 1536],
+                     'matrix-type': 'IPS',
+                     'multi-touch': True
+                    },
+                    'os': {
+                     'type': 'iOS',
+                     'version': '8'
+                    },
+                    'cpu': 'Apple A8X',
+                    'ram': '8GB',
+                    'colors': ['Gold', 'Silver', 'Space Gray'],
+                    'models': [
+                     {
+                         'name': 'Wi-Fi',
+                         'capacity': ['16GB', '64GB'],
+                         'height': 240,
+                         'width': 169.5,
+                         'depth': 6.1,
+                         'weight': 437,
+                     },
+                     {
+                         'name': 'Wi-Fi + Cellular',
+                         'capacity': ['16GB', '64GB'],
+                         'height': 240,
+                         'width': 169.5,
+                         'depth': 6.1,
+                         'weight': 444,
+                     },
+                    ],
+                    'discontinued': False,
+                    'videoUrl': None,
+                    'non-ascii-attr': u'\u0442\u0435\u0441\u0442'
                 },
-                'os': {
-                 'type': 'iOS',
-                 'version': '8'
-                },
-                'cpu': 'Apple A8X',
-                'ram': '8GB',
-                'colors': ['Gold', 'Silver', 'Space Gray'],
-                'models': [
-                 {
-                     'name': 'Wi-Fi',
-                     'capacity': ['16GB', '64GB'],
-                     'height': 240,
-                     'width': 169.5,
-                     'depth': 6.1,
-                     'weight': 437,
-                 },
-                 {
-                     'name': 'Wi-Fi + Cellular',
-                     'capacity': ['16GB', '64GB'],
-                     'height': 240,
-                     'width': 169.5,
-                     'depth': 6.1,
-                     'weight': 444,
-                 },
-                ],
-                'discontinued': False,
-                'videoUrl': None,
-                'non-ascii-attr': u'\u0442\u0435\u0441\u0442'
-            },
-            tags=['Tablets', 'Apple', 'Retina'])
+                tags=['Tablets', 'Apple', 'Retina'])
 
 
     def test(self):
@@ -618,6 +609,17 @@ class TestJson(TestCase):
         p = get(p for p in self.Product if p.info['some_attr'] is None)
         self.assertTrue(p)
 
+    @db_session
+    def test_str_cast(self):
+        p = get(coalesce(str(p.name), 'empty') for p in self.Product)
+        self.assertTrue('AS text' in self.db.last_sql)
+
+    @db_session
+    def test_int_cast(self):
+        p = get(coalesce(int(p.info['os']['version']), 0) for p in self.Product)
+        self.assertTrue('as integer' in self.db.last_sql)
+
+
     def test_nonzero(self):
         Product = self.Product
         with db_session:
@@ -654,3 +656,8 @@ class TestJson(TestCase):
         flush()
         p1.name = 'name3'
         flush()
+
+    @db_session
+    def test_avg(self):
+        result = select(avg(p.info['display']['size']) for p in self.Product).first()
+        self.assertAlmostEqual(result, 9.7)

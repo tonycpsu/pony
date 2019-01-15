@@ -12,12 +12,14 @@ from uuid import UUID
 from binascii import hexlify
 from functools import wraps
 
-from pony.orm import core, dbschema, sqltranslation, dbapiprovider
+from pony.orm import core, dbschema, dbapiprovider
 from pony.orm.core import log_orm
-from pony.orm.ormtypes import Json
+from pony.orm.ormtypes import Json, TrackedArray
+from pony.orm.sqltranslation import SQLTranslator, StringExprMonad
 from pony.orm.sqlbuilding import SQLBuilder, join, make_unary_func
 from pony.orm.dbapiprovider import DBAPIProvider, Pool, wrap_dbapi_exceptions
-from pony.utils import datetime2timestamp, timestamp2datetime, absolutize_path, localbase, throw, reraise
+from pony.utils import datetime2timestamp, timestamp2datetime, absolutize_path, localbase, throw, reraise, \
+    cut_traceback_depth
 
 class SqliteExtensionUnavailable(Exception):
     pass
@@ -38,12 +40,12 @@ def make_overriden_string_func(sqlop):
         sql = monad.getsql()
         assert len(sql) == 1
         translator = monad.translator
-        return translator.StringExprMonad(translator, monad.type, [ sqlop, sql[0] ])
+        return StringExprMonad(monad.type, [ sqlop, sql[0] ])
     func.__name__ = sqlop
     return func
 
 
-class SQLiteTranslator(sqltranslation.SQLTranslator):
+class SQLiteTranslator(SQLTranslator):
     dialect = 'SQLite'
     sqlite_version = sqlite.sqlite_version_info
     row_value_syntax = False
@@ -54,11 +56,13 @@ class SQLiteTranslator(sqltranslation.SQLTranslator):
 
 class SQLiteBuilder(SQLBuilder):
     dialect = 'SQLite'
+    least_func_name = 'min'
+    greatest_func_name = 'max'
     def __init__(builder, provider, ast):
         builder.json1_available = provider.json1_available
         SQLBuilder.__init__(builder, provider, ast)
-    def SELECT_FOR_UPDATE(builder, nowait, *sections):
-        assert not builder.indent and not nowait
+    def SELECT_FOR_UPDATE(builder, nowait, skip_locked, *sections):
+        assert not builder.indent
         return builder.SELECT(*sections)
     def INSERT(builder, table_name, columns, values, returning=None):
         if not values: return 'INSERT INTO %s DEFAULT VALUES' % builder.quote_name(table_name)
@@ -117,16 +121,6 @@ class SQLiteBuilder(SQLBuilder):
         if isinstance(delta, timedelta):
             return builder.datetime_add('datetime', expr, -delta)
         return 'datetime(julianday(', builder(expr), ') - ', builder(delta), ')'
-    def MIN(builder, *args):
-        if len(args) == 0: assert False  # pragma: no cover
-        elif len(args) == 1: fname = 'MIN'
-        else: fname = 'min'
-        return fname, '(',  join(', ', imap(builder, args)), ')'
-    def MAX(builder, *args):
-        if len(args) == 0: assert False  # pragma: no cover
-        elif len(args) == 1: fname = 'MAX'
-        else: fname = 'max'
-        return fname, '(',  join(', ', imap(builder, args)), ')'
     def RANDOM(builder):
         return 'rand()'  # return '(random() / 9223372036854775807.0 + 1.0) / 2.0'
     PY_UPPER = make_unary_func('py_upper')
@@ -157,6 +151,20 @@ class SQLiteBuilder(SQLBuilder):
     def JSON_CONTAINS(builder, expr, path, key):
         path_sql, has_params, has_wildcards = builder.build_json_path(path)
         return 'py_json_contains(', builder(expr), ', ', path_sql, ',  ', builder(key), ')'
+    def ARRAY_INDEX(builder, col, index):
+        return 'py_array_index(', builder(col), ', ', builder(index), ')'
+    def ARRAY_CONTAINS(builder, key, not_in, col):
+        return ('NOT ' if not_in else ''), 'py_array_contains(', builder(col), ', ', builder(key), ')'
+    def ARRAY_SUBSET(builder, array1, not_in, array2):
+        return ('NOT ' if not_in else ''), 'py_array_subset(', builder(array2), ', ', builder(array1), ')'
+    def ARRAY_LENGTH(builder, array):
+        return 'py_array_length(', builder(array), ')'
+    def ARRAY_SLICE(builder, array, start, stop):
+        return 'py_array_slice(', builder(array), ', ', \
+               builder(start) if start else 'null', ',',\
+               builder(stop) if stop else 'null', ')'
+    def MAKE_ARRAY(builder, *items):
+        return 'py_make_array(', join(', ', (builder(item) for item in items)), ')'
 
 class SQLiteIntConverter(dbapiprovider.IntConverter):
     def sql_type(converter):
@@ -212,6 +220,25 @@ class SQLiteDatetimeConverter(dbapiprovider.DatetimeConverter):
 class SQLiteJsonConverter(dbapiprovider.JsonConverter):
     json_kwargs = {'separators': (',', ':'), 'sort_keys': True, 'ensure_ascii': False}
 
+def dumps(items):
+    return json.dumps(items, **SQLiteJsonConverter.json_kwargs)
+
+class SQLiteArrayConverter(dbapiprovider.ArrayConverter):
+    array_types = {
+        int: ('int', SQLiteIntConverter),
+        unicode: ('text', dbapiprovider.StrConverter),
+        float: ('real', dbapiprovider.RealConverter)
+    }
+
+    def dbval2val(converter, dbval, obj=None):
+        if not dbval: return None
+        items = json.loads(dbval)
+        if obj is None:
+            return items
+        return TrackedArray(obj, converter.attr, items)
+
+    def val2dbval(converter, val, obj=None):
+        return dumps(val)
 
 class LocalExceptions(localbase):
     def __init__(self):
@@ -240,12 +267,12 @@ class SQLiteProvider(DBAPIProvider):
     dialect = 'SQLite'
     local_exceptions = local_exceptions
     max_name_len = 1024
-    select_for_update_nowait_syntax = False
 
     dbapi_module = sqlite
     dbschema_cls = SQLiteSchema
     translator_cls = SQLiteTranslator
     sqlbuilder_cls = SQLiteBuilder
+    array_converter_cls = SQLiteArrayConverter
 
     name_before_table = 'db_name'
 
@@ -368,7 +395,7 @@ class SQLiteProvider(DBAPIProvider):
             # 2 - pony.dbapiprovider.DBAPIProvider.__init__()
             # 1 - SQLiteProvider.__init__()
             # 0 - pony.dbproviders.sqlite.get_pool()
-            filename = absolutize_path(filename, frame_depth=7)
+            filename = absolutize_path(filename, frame_depth=cut_traceback_depth+5)
         return SQLitePool(filename, create_db, **kwargs)
 
     def table_exists(provider, connection, table_name, case_sensitive=True):
@@ -434,12 +461,14 @@ py_lower = make_string_function('py_lower', unicode.lower)
 
 def py_json_unwrap(value):
     # [null,some-value] -> some-value
+    if value is None:
+        return None
     assert value.startswith('[null,'), value
     return value[6:-1]
 
 path_cache = {}
 
-json_path_re = re.compile(r'\[(\d+)\]|\.(?:(\w+)|"([^"]*)")', re.UNICODE)
+json_path_re = re.compile(r'\[(-?\d+)\]|\.(?:(\w+)|"([^"]*)")', re.UNICODE)
 
 def _parse_path(path):
     if path in path_cache:
@@ -515,6 +544,43 @@ def py_json_array_length(expr, path=None):
         expr = _traverse(expr, keys)
     return len(expr) if type(expr) is list else 0
 
+def wrap_array_func(func):
+    @wraps(func)
+    def new_func(array, *args):
+        if array is None:
+            return None
+        array = json.loads(array)
+        return func(array, *args)
+    return new_func
+
+@wrap_array_func
+def py_array_index(array, index):
+    try:
+        return array[index]
+    except IndexError:
+        return None
+
+@wrap_array_func
+def py_array_contains(array, item):
+    return item in array
+
+@wrap_array_func
+def py_array_subset(array, items):
+    if items is None: return None
+    items = json.loads(items)
+    return set(items).issubset(set(array))
+
+@wrap_array_func
+def py_array_length(array):
+    return len(array)
+
+@wrap_array_func
+def py_array_slice(array, start, stop):
+    return dumps(array[start:stop])
+
+def py_make_array(*items):
+    return dumps(items)
+
 class SQLitePool(Pool):
     def __init__(pool, filename, create_db, row_factory=None, **kwargs): # called separately in each thread
         pool.filename = filename
@@ -547,8 +613,17 @@ class SQLitePool(Pool):
         create_function('py_json_nonzero', 2, py_json_nonzero)
         create_function('py_json_array_length', -1, py_json_array_length)
 
+        create_function('py_array_index', 2, py_array_index)
+        create_function('py_array_contains', 2, py_array_contains)
+        create_function('py_array_subset', 2, py_array_subset)
+        create_function('py_array_length', 1, py_array_length)
+        create_function('py_array_slice', 3, py_array_slice)
+        create_function('py_make_array', -1, py_make_array)
+
         if sqlite.sqlite_version_info >= (3, 6, 19):
             con.execute('PRAGMA foreign_keys = true')
+
+        con.execute('PRAGMA case_sensitive_like = true')
     def disconnect(pool):
         if pool.filename != ':memory:':
             Pool.disconnect(pool)

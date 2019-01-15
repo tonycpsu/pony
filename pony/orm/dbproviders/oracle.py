@@ -106,15 +106,15 @@ class OraSchema(DBSchema):
     column_class = OraColumn
 
 class OraNoneMonad(sqltranslation.NoneMonad):
-    def __init__(monad, translator, value=None):
+    def __init__(monad, value=None):
         assert value in (None, '')
-        sqltranslation.ConstMonad.__init__(monad, translator, None)
+        sqltranslation.ConstMonad.__init__(monad, None)
 
 class OraConstMonad(sqltranslation.ConstMonad):
     @staticmethod
-    def new(translator, value):
+    def new(value):
         if value == '': value = None
-        return sqltranslation.ConstMonad.new(translator, value)
+        return sqltranslation.ConstMonad.new(value)
 
 class OraTranslator(sqltranslation.SQLTranslator):
     dialect = 'Oracle'
@@ -124,11 +124,6 @@ class OraTranslator(sqltranslation.SQLTranslator):
     NoneMonad = OraNoneMonad
     ConstMonad = OraConstMonad
 
-    @classmethod
-    def get_normalized_type_of(translator, value):
-        if value == '': return NoneType
-        return sqltranslation.SQLTranslator.get_normalized_type_of(value)
-
 class OraBuilder(SQLBuilder):
     dialect = 'Oracle'
     def INSERT(builder, table_name, columns, values, returning=None):
@@ -136,11 +131,13 @@ class OraBuilder(SQLBuilder):
         if returning is not None:
             result.extend((' RETURNING ', builder.quote_name(returning), ' INTO :new_id'))
         return result
-    def SELECT_FOR_UPDATE(builder, nowait, *sections):
+    def SELECT_FOR_UPDATE(builder, nowait, skip_locked, *sections):
         assert not builder.indent
+        nowait = ' NOWAIT' if nowait else ''
+        skip_locked = ' SKIP LOCKED' if skip_locked else ''
         last_section = sections[-1]
         if last_section[0] != 'LIMIT':
-            return builder.SELECT(*sections), 'FOR UPDATE NOWAIT\n' if nowait else 'FOR UPDATE\n'
+            return builder.SELECT(*sections), 'FOR UPDATE', nowait, skip_locked, '\n'
 
         from_section = sections[1]
         assert from_section[0] == 'FROM'
@@ -159,7 +156,7 @@ class OraBuilder(SQLBuilder):
                     ('SELECT', [ 'ROWID', ['AS', rowid, 'row-id' ] ]) + sections[1:] ] ] ]
         if order_by_section: sql_ast.append(order_by_section)
         result = builder(sql_ast)
-        return result, 'FOR UPDATE NOWAIT\n' if nowait else 'FOR UPDATE\n'
+        return result, 'FOR UPDATE', nowait, skip_locked, '\n'
     def SELECT(builder, *sections):
         prev_suppress_aliases = builder.suppress_aliases
         builder.suppress_aliases = False
@@ -170,7 +167,7 @@ class OraBuilder(SQLBuilder):
                 limit = last_section[1]
                 if len(last_section) > 2: offset = last_section[2]
                 sections = sections[:-1]
-            result = builder.subquery(*sections)
+            result = builder._subquery(*sections)
             indent = builder.indent_spaces * builder.indent
 
             if sections[0][0] == 'ROWID':
@@ -180,26 +177,26 @@ class OraBuilder(SQLBuilder):
                 indent0 = ''
                 x = 't.*'
 
-            if not limit: pass
+            if not limit and not offset:
+                pass
             elif not offset:
                 result = [ indent0, 'SELECT * FROM (\n' ]
                 builder.indent += 1
-                result.extend(builder.subquery(*sections))
+                result.extend(builder._subquery(*sections))
                 builder.indent -= 1
-                result.extend((indent, ') WHERE ROWNUM <= ', builder(limit), '\n'))
+                result.extend((indent, ') WHERE ROWNUM <= %d\n' % limit))
             else:
                 indent2 = indent + builder.indent_spaces
                 result = [ indent0, 'SELECT %s FROM (\n' % x, indent2, 'SELECT t.*, ROWNUM "row-num" FROM (\n' ]
                 builder.indent += 2
-                result.extend(builder.subquery(*sections))
+                result.extend(builder._subquery(*sections))
                 builder.indent -= 2
-                result.extend((indent2, ') t '))
-                if limit[0] == 'VALUE' and offset[0] == 'VALUE' \
-                        and isinstance(limit[1], int) and isinstance(offset[1], int):
-                    total_limit = [ 'VALUE', limit[1] + offset[1] ]
-                    result.extend(('WHERE ROWNUM <= ', builder(total_limit), '\n'))
-                else: result.extend(('WHERE ROWNUM <= ', builder(limit), ' + ', builder(offset), '\n'))
-                result.extend((indent, ') t WHERE "row-num" > ', builder(offset), '\n'))
+                if limit is None:
+                    result.append('%s) t\n' % indent2)
+                    result.append('%s) t WHERE "row-num" > %d\n' % (indent, offset))
+                else:
+                    result.append('%s) t WHERE ROWNUM <= %d\n' % (indent2, limit + offset))
+                    result.append('%s) t WHERE "row-num" > %d\n' % (indent, offset))
             if builder.indent:
                 indent = builder.indent_spaces * builder.indent
                 return '(\n', result, indent + ')'
@@ -210,6 +207,10 @@ class OraBuilder(SQLBuilder):
         return builder.ALL(*expr_list)
     def LIMIT(builder, limit, offset=None):
         assert False  # pragma: no cover
+    def TO_REAL(builder, expr):
+        return 'CAST(', builder(expr), ' AS NUMBER)'
+    def TO_STR(builder, expr):
+        return 'TO_CHAR(', builder(expr), ')'
     def DATE(builder, expr):
         return 'TRUNC(', builder(expr), ')'
     def RANDOM(builder):
@@ -273,6 +274,14 @@ class OraBuilder(SQLBuilder):
         return result
     def JSON_ARRAY_LENGTH(builder, value):
         throw(TranslationError, 'Oracle does not provide `length` function for JSON arrays')
+    def GROUP_CONCAT(builder, distinct, expr, sep=None):
+        assert distinct in (None, True, False)
+        result = 'LISTAGG(', builder(expr)
+        if sep is not None:
+            result = result, ', ', builder(sep)
+        else:
+            result = result, ", ','"
+        return result, ') WITHIN GROUP(ORDER BY 1)'
 
 json_item_re = re.compile('[\w\s]*')
 
@@ -430,10 +439,11 @@ class OraProvider(DBAPIProvider):
         return name[:provider.max_name_len].upper()
 
     def normalize_vars(provider, vars, vartypes):
-        for name, value in iteritems(vars):
+        DBAPIProvider.normalize_vars(provider, vars, vartypes)
+        for key, value in iteritems(vars):
             if value == '':
-                vars[name] = None
-                vartypes[name] = NoneType
+                vars[key] = None
+                vartypes[key] = NoneType
 
     @wrap_dbapi_exceptions
     def set_transaction_mode(provider, connection, cache):
@@ -461,7 +471,11 @@ class OraProvider(DBAPIProvider):
                 arguments['new_id'] = var
                 if arguments is None: cursor.execute(sql)
                 else: cursor.execute(sql, arguments)
-                return var.getvalue()
+                value = var.getvalue()
+                if isinstance(value, list):
+                    assert len(value) == 1
+                    value = value[0]
+                return value
             if arguments is None: cursor.execute(sql)
             else: cursor.execute(sql, arguments)
 
@@ -573,7 +587,7 @@ class OraPool(object):
         if core.local.debug: log_orm('GET CONNECTION')
         con = pool.cx_pool.acquire()
         con.outputtypehandler = output_type_handler
-        return con
+        return con, True
     def release(pool, con):
         pool.cx_pool.release(con)
     def drop(pool, con):

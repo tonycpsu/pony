@@ -1,5 +1,5 @@
 from __future__ import absolute_import, print_function
-from pony.py23compat import PY2, imap, basestring, unicode, pickle
+from pony.py23compat import PY2, imap, basestring, unicode, pickle, iteritems
 
 import io, re, os.path, sys, inspect, types, warnings
 
@@ -8,8 +8,9 @@ from itertools import count as _count
 from inspect import isfunction
 from time import strptime
 from collections import defaultdict
-from functools import update_wrapper
+from functools import update_wrapper, wraps
 from xml.etree import cElementTree
+from copy import deepcopy
 
 import pony
 from pony import options
@@ -54,7 +55,7 @@ def decorator_with_params(dec):
 
 @decorator
 def cut_traceback(func, *args, **kwargs):
-    if not (pony.MODE == 'INTERACTIVE' and options.CUT_TRACEBACK):
+    if not options.CUT_TRACEBACK:
         return func(*args, **kwargs)
 
     try: return func(*args, **kwargs)
@@ -77,6 +78,13 @@ def cut_traceback(func, *args, **kwargs):
             reraise(exc_type, exc, full_tb)
         finally:
             del exc, full_tb, tb, last_pony_tb
+
+cut_traceback_depth = 2
+
+if pony.MODE != 'INTERACTIVE':
+    cut_traceback_depth = 0
+    def cut_traceback(func):
+        return func
 
 if PY2:
     exec('''def reraise(exc_type, exc, tb):
@@ -127,7 +135,7 @@ def get_lambda_args(func):
 
     if type(func) is types.FunctionType:
         if hasattr(inspect, 'signature'):
-            names, argsname, kwname, defaults = [], None, None, None
+            names, argsname, kwname, defaults = [], None, None, []
             for p in inspect.signature(func).parameters.values():
                 if p.default is not p.empty:
                     defaults.append(p.default)
@@ -343,6 +351,11 @@ def avg(iter):
     if not count: return None
     return sum / count
 
+def group_concat(items, sep=','):
+    if items is None:
+        return None
+    return str(sep).join(str(item) for item in items)
+
 def coalesce(*args):
     for arg in args:
         if arg is not None:
@@ -388,3 +401,34 @@ def unpickle_ast(pickled):
 
 def copy_ast(tree):
     return unpickle_ast(pickle_ast(tree))
+
+def _hashable_wrap(func):
+    @wraps(func, assigned=('__name__', '__doc__'))
+    def new_func(self, *args, **kwargs):
+        if getattr(self, '_hash', None) is not None:
+            assert False, 'Cannot mutate HashableDict instance after the hash value is calculated'
+        return func(self, *args, **kwargs)
+    return new_func
+
+class HashableDict(dict):
+    def __hash__(self):
+        result = getattr(self, '_hash', None)
+        if result is None:
+            result = 0
+            for key, value in self.items():
+                result ^= hash(key)
+                result ^= hash(value)
+            self._hash = result
+        return result
+    def __deepcopy__(self, memo):
+        if getattr(self, '_hash', None) is not None:
+            return self
+        return HashableDict({deepcopy(key, memo): deepcopy(value, memo)
+                            for key, value in iteritems(self)})
+    __setitem__ = _hashable_wrap(dict.__setitem__)
+    __delitem__ = _hashable_wrap(dict.__delitem__)
+    clear = _hashable_wrap(dict.clear)
+    pop = _hashable_wrap(dict.pop)
+    popitem = _hashable_wrap(dict.popitem)
+    setdefault = _hashable_wrap(dict.setdefault)
+    update = _hashable_wrap(dict.update)

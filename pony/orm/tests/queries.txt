@@ -146,6 +146,22 @@ SELECT "s"."group", MIN("s"."gpa"), MAX("s"."gpa")
 FROM "Student" "s"
 GROUP BY "s"."group"
 
+>>> select((g, min(g.students.gpa), max(g.students.gpa)) for g in Group)
+
+SELECT "g"."number", MIN("student"."gpa"), MAX("student"."gpa")
+FROM "Group" "g"
+  LEFT JOIN "Student" "student"
+    ON "g"."number" = "student"."group"
+GROUP BY "g"."number"
+
+>>> select((g, g.students.name, min(g.students.gpa), max(g.students.gpa)) for g in Group)
+
+SELECT "g"."number", "student"."name", MIN("student"."gpa"), MAX("student"."gpa")
+FROM "Group" "g"
+  LEFT JOIN "Student" "student"
+    ON "g"."number" = "student"."group"
+GROUP BY "g"."number", "student"."name"
+
 >>> count(s for s in Student if s.group.number == 101)
 
 SELECT COUNT(*)
@@ -914,3 +930,63 @@ Oracle:
 SELECT "s"."ID", "s"."NAME", "s"."DOB", "s"."TEL", "s"."GPA", "s"."GROUP"
 FROM "STUDENT" "s"
 WHERE MOD("s"."ID", 2) = 0
+
+# Test group_concat:
+
+>>> select((g, group_concat(s.name, '+')) for g in Group for s in g.students)
+
+SELECT "g"."number", GROUP_CONCAT("s"."name", '+')
+FROM "Group" "g", "Student" "s"
+WHERE "g"."number" = "s"."group"
+GROUP BY "g"."number"
+
+PostgreSQL:
+
+SELECT "g"."number", string_agg("s"."name"::text, '+')
+FROM "group" "g", "student" "s"
+WHERE "g"."number" = "s"."group"
+GROUP BY "g"."number"
+
+MySQL:
+
+SELECT `g`.`number`, GROUP_CONCAT(`s`.`name`, '+')
+FROM `group` `g`, `student` `s`
+WHERE `g`.`number` = `s`.`group`
+GROUP BY `g`.`number`
+
+Oracle:
+
+SELECT "g"."NUMBER", LISTAGG("s"."NAME", '+') WITHIN GROUP(ORDER BY 1)
+FROM "GROUP" "g", "STUDENT" "s"
+WHERE "g"."NUMBER" = "s"."GROUP"
+GROUP BY "g"."NUMBER"
+
+# Test offset without limit
+
+>>> select(s for s in Student)[3:]
+
+SELECT "s"."id", "s"."name", "s"."dob", "s"."tel", "s"."gpa", "s"."group"
+FROM "Student" "s"
+LIMIT -1 OFFSET 3
+
+PostgreSQL:
+
+SELECT "s"."id", "s"."name", "s"."dob", "s"."tel", "s"."gpa", "s"."group"
+FROM "student" "s"
+LIMIT null OFFSET 3
+
+MySQL:
+
+SELECT `s`.`id`, `s`.`name`, `s`.`dob`, `s`.`tel`, `s`.`gpa`, `s`.`group`
+FROM `student` `s`
+LIMIT 18446744073709551615 OFFSET 3
+
+Oracle:
+
+SELECT t.* FROM (
+    SELECT t.*, ROWNUM "row-num" FROM (
+        SELECT "s"."ID", "s"."NAME", "s"."DOB", "s"."TEL", "s"."GPA", "s"."GROUP"
+        FROM "STUDENT" "s"
+    ) t 
+) t WHERE "row-num" > 3
+

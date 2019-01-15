@@ -1,5 +1,5 @@
 from __future__ import absolute_import, print_function, division
-from pony.py23compat import PY2, basestring, unicode, buffer, int_types
+from pony.py23compat import PY2, basestring, unicode, buffer, int_types, iteritems
 
 import os, re, json
 from decimal import Decimal, InvalidOperation
@@ -9,7 +9,7 @@ from uuid import uuid4, UUID
 import pony
 from pony.utils import is_utf8, decorator, throw, localbase, deprecated
 from pony.converting import str2date, str2time, str2datetime, str2timedelta
-from pony.orm.ormtypes import LongStr, LongUnicode, RawSQLType, TrackedValue, Json
+from pony.orm.ormtypes import LongStr, LongUnicode, RawSQLType, TrackedValue, TrackedArray, Json, QueryType, Array
 
 class DBException(Exception):
     def __init__(exc, original_exc, *args):
@@ -69,9 +69,9 @@ def wrap_dbapi_exceptions(func, provider, *args, **kwargs):
     except dbapi_module.Warning as e: raise Warning(e)
 
 def unexpected_args(attr, args):
-    throw(TypeError,
-        'Unexpected positional argument%s for attribute %s: %r'
-        % ((args > 1 and 's' or ''), attr, ', '.join(repr(arg) for arg in args)))
+    throw(TypeError, 'Unexpected positional argument{} for attribute {}: {}'.format(
+        len(args) > 1 and 's' or '', attr, ', '.join(repr(arg) for arg in args))
+    )
 
 version_re = re.compile('[0-9\.]+')
 
@@ -85,13 +85,12 @@ def get_version_tuple(s):
 class DBAPIProvider(object):
     paramstyle = 'qmark'
     quote_char = '"'
-    max_params_count = 200
+    max_params_count = 999
     max_name_len = 128
     table_if_not_exists_syntax = True
     index_if_not_exists_syntax = True
     max_time_precision = default_time_precision = 6
     uint64_support = False
-    select_for_update_nowait_syntax = True
 
     # SQLite and PostgreSQL does not limit varchar max length.
     varchar_default_max_len = None
@@ -101,6 +100,7 @@ class DBAPIProvider(object):
     dbschema_cls = None
     translator_cls = None
     sqlbuilder_cls = None
+    array_converter_cls = None
 
     name_before_table = 'schema_name'
     default_schema_name = None
@@ -109,9 +109,12 @@ class DBAPIProvider(object):
 
     def __init__(provider, *args, **kwargs):
         pool_mockup = kwargs.pop('pony_pool_mockup', None)
+        call_on_connect = kwargs.pop('pony_call_on_connect', None)
         if pool_mockup: provider.pool = pool_mockup
         else: provider.pool = provider.get_pool(*args, **kwargs)
-        connection = provider.connect()
+        connection, is_new_connection = provider.connect()
+        if call_on_connect:
+            call_on_connect(connection)
         provider.inspect_connection(connection)
         provider.release(connection)
 
@@ -134,23 +137,23 @@ class DBAPIProvider(object):
         return provider.normalize_name(name)
 
     def get_default_column_names(provider, attr, reverse_pk_columns=None):
-        normalize = provider.normalize_name
+        normalize_name = provider.normalize_name
         if reverse_pk_columns is None:
-            return [ normalize(attr.name) ]
+            return [ normalize_name(attr.name) ]
         elif len(reverse_pk_columns) == 1:
-            return [ normalize(attr.name) ]
+            return [ normalize_name(attr.name) ]
         else:
             prefix = attr.name + '_'
-            return [ normalize(prefix + column) for column in reverse_pk_columns ]
+            return [ normalize_name(prefix + column) for column in reverse_pk_columns ]
 
     def get_default_m2m_column_names(provider, entity):
-        normalize = provider.normalize_name
+        normalize_name = provider.normalize_name
         columns = entity._get_pk_columns_()
         if len(columns) == 1:
-            return [ normalize(entity.__name__.lower()) ]
+            return [ normalize_name(entity.__name__.lower()) ]
         else:
             prefix = entity.__name__.lower() + '_'
-            return [ normalize(prefix + column) for column in columns ]
+            return [ normalize_name(prefix + column) for column in columns ]
 
     def get_default_index_name(provider, table_name, column_names, is_pk=False, is_unique=False, m2m=False):
         if is_pk: index_name = 'pk_%s' % provider.base_name(table_name)
@@ -195,7 +198,10 @@ class DBAPIProvider(object):
         return provider.quote_name(name)
 
     def normalize_vars(provider, vars, vartypes):
-        pass
+        for key, value in iteritems(vars):
+            vartype = vartypes[key]
+            if isinstance(vartype, QueryType):
+                vartypes[key], vars[key] = value._normalize_var(vartype)
 
     def ast2sql(provider, ast):
         builder = provider.sqlbuilder_cls(provider, ast)
@@ -264,6 +270,11 @@ class DBAPIProvider(object):
         if isinstance(py_type, type):
             for t, converter_cls in provider.converter_classes:
                 if issubclass(py_type, t): return converter_cls
+            if issubclass(py_type, Array):
+                converter_cls = provider.array_converter_cls
+                if converter_cls is None:
+                    throw(NotImplementedError, 'Array type is not supported for %r' % provider.dialect)
+                return converter_cls
         if isinstance(py_type, RawSQLType):
             return Converter  # for cases like select(raw_sql(...) for x in X)
         throw(TypeError, 'No database converter found for type %s' % py_type)
@@ -318,12 +329,15 @@ class Pool(localbase):
             pool.forked_connections.append((pool.con, pool.pid))
             pool.con = pool.pid = None
         core = pony.orm.core
+        is_new_connection = False
         if pool.con is None:
             if core.local.debug: core.log_orm('GET NEW CONNECTION')
+            is_new_connection = True
             pool._connect()
             pool.pid = pid
-        elif core.local.debug: core.log_orm('GET CONNECTION FROM THE LOCAL POOL')
-        return pool.con
+        elif core.local.debug:
+            core.log_orm('GET CONNECTION FROM THE LOCAL POOL')
+        return pool.con, is_new_connection
     def _connect(pool):
         pool.con = pool.dbapi_module.connect(*pool.args, **pool.kwargs)
     def release(pool, con):
@@ -502,6 +516,8 @@ class IntConverter(Converter):
         converter.unsigned = unsigned
     def validate(converter, val, obj=None):
         if isinstance(val, int_types): pass
+        elif hasattr(val, '__index__'):
+            val = val.__index__()
         elif isinstance(val, basestring):
             try: val = int(val)
             except ValueError: throw(ValueError,
@@ -641,6 +657,10 @@ class BlobConverter(Converter):
         if not isinstance(val, buffer):
             try: val = buffer(val)
             except: pass
+        elif PY2 and converter.attr is not None and converter.attr.is_part_of_unique_index:
+            try: hash(val)
+            except TypeError:
+                val = buffer(val)
         return val
     def sql_type(converter):
         return 'BLOB'
@@ -788,3 +808,50 @@ class JsonConverter(Converter):
         return x == y
     def sql_type(converter):
         return "JSON"
+
+class ArrayConverter(Converter):
+    array_types = {
+        int: ('int', IntConverter),
+        unicode: ('text', StrConverter),
+        float: ('real', RealConverter)
+    }
+
+    def __init__(converter, provider, py_type, attr=None):
+        Converter.__init__(converter, provider, py_type, attr)
+        converter.item_converter = converter.array_types[converter.py_type.item_type][1]
+
+    def validate(converter, val, obj=None):
+        if isinstance(val, TrackedValue) and val.obj_ref() is obj and val.attr is converter.attr:
+            return val
+
+        if isinstance(val, basestring) or not hasattr(val, '__len__'):
+            items = [val]
+        else:
+            items = list(val)
+        item_type = converter.py_type.item_type
+        if item_type == float:
+            item_type = (float, int)
+        for i, v in enumerate(items):
+            if PY2 and isinstance(v, str):
+                v = v.decode('ascii')
+            if not isinstance(v, item_type):
+                if hasattr(v, '__index__'):
+                    items[i] = v.__index__()
+                else:
+                    throw(TypeError, 'Cannot store %s item in array of %s' %
+                          (type(v).__name__, converter.py_type.item_type.__name__))
+
+        if obj is None or converter.attr is None:
+            return items
+        return TrackedArray(obj, converter.attr, items)
+
+    def dbval2val(converter, dbval, obj=None):
+        if obj is None:
+            return dbval
+        return TrackedArray(obj, converter.attr, dbval)
+
+    def val2dbval(converter, val, obj=None):
+        return list(val)
+
+    def sql_type(converter):
+        return '%s[]' % converter.array_types[converter.py_type.item_type][0]

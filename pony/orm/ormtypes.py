@@ -45,6 +45,8 @@ class FuncType(object):
         return type(other) is not FuncType or self.func != other.func
     def __hash__(self):
         return hash(self.func) + 1
+    def __repr__(self):
+        return 'FuncType(%s at %d)' % (self.func.__name__, id(self.func))
 
 class MethodType(object):
     __slots__ = 'obj', 'func'
@@ -101,8 +103,7 @@ class RawSQL(object):
     def __init__(self, sql, globals=None, locals=None, result_type=None):
         self.sql = sql
         self.items, self.codes = parse_raw_sql(sql)
-        self.values = tuple(eval(code, globals, locals) for code in self.codes)
-        self.types = tuple(get_normalized_type_of(value) for value in self.values)
+        self.types, self.values = normalize(tuple(eval(code, globals, locals) for code in self.codes))
         self.result_type = result_type
     def _get_type_(self):
         return RawSQLType(self.sql, self.items, self.types, self.result_type)
@@ -122,32 +123,73 @@ class RawSQLType(object):
     def __ne__(self, other):
         return not self.__eq__(other)
 
-numeric_types = {bool, int, float, Decimal}
-comparable_types = {int, float, Decimal, unicode, date, time, datetime, timedelta, bool, UUID}
-primitive_types = comparable_types | {buffer}
-function_types = {type, types.FunctionType, types.BuiltinFunctionType}
-type_normalization_dict = { long : int } if PY2 else {}
+class QueryType(object):
+    def __init__(self, query, limit=None, offset=None):
+        self.query_key = query._key
+        self.translator = query._translator
+        self.limit = limit
+        self.offset = offset
+    def __hash__(self):
+        result = hash(self.query_key)
+        if self.limit is not None:
+            result ^= hash(self.limit + 3)
+        if self.offset is not None:
+            result ^= hash(self.offset)
+        return result
+    def __eq__(self, other):
+        return type(other) is QueryType and self.query_key == other.query_key \
+               and self.limit == other.limit and self.offset == other.offset
+    def __ne__(self, other):
+        return not self.__eq__(other)
 
-def get_normalized_type_of(value):
+
+def normalize(value):
     t = type(value)
-    if t is tuple: return tuple(get_normalized_type_of(item) for item in value)
-    if t.__name__ == 'EntityMeta': return SetType(value)
-    if t.__name__ == 'EntityIter': return SetType(value.entity)
+    if t.__name__ == 'LocalProxy' and '_get_current_object' in t.__dict__:
+        value = value._get_current_object()
+        t = type(value)
+
+    if t is tuple:
+        item_types, item_values = [], []
+        for item in value:
+            item_type, item_value = normalize(item)
+            item_values.append(item_value)
+            item_types.append(item_type)
+        return tuple(item_types), tuple(item_values)
+
+    if t.__name__ == 'EntityMeta':
+        return SetType(value), value
+
+    if t.__name__ == 'EntityIter':
+        entity = value.entity
+        return SetType(entity), entity
+
     if PY2 and isinstance(value, str):
-        try: value.decode('ascii')
-        except UnicodeDecodeError: throw(TypeError,
-            'The bytestring %r contains non-ascii symbols. Try to pass unicode string instead' % value)
-        else: return unicode
-    elif isinstance(value, unicode): return unicode
-    if t in function_types: return FuncType(value)
-    if t is types.MethodType: return MethodType(value)
+        try:
+            value.decode('ascii')
+        except UnicodeDecodeError:
+            throw(TypeError, 'The bytestring %r contains non-ascii symbols. Try to pass unicode string instead' % value)
+        else:
+            return unicode, value
+    elif isinstance(value, unicode):
+        return unicode, value
+
+    if t in function_types:
+        return FuncType(value), value
+
+    if t is types.MethodType:
+        return MethodType(value), value
+
     if hasattr(value, '_get_type_'):
-        return value._get_type_()
-    return normalize_type(t)
+        return value._get_type_(), value
+
+    return normalize_type(t), value
 
 def normalize_type(t):
     tt = type(t)
     if tt is tuple: return tuple(normalize_type(item) for item in t)
+    if not isinstance(t, type):
+        return t
     assert t.__name__ != 'EntityMeta'
     if tt.__name__ == 'EntityMeta': return t
     if t is NoneType: return t
@@ -156,15 +198,16 @@ def normalize_type(t):
     if t in (slice, type(Ellipsis)): return t
     if issubclass(t, basestring): return unicode
     if issubclass(t, (dict, Json)): return Json
+    if issubclass(t, Array): return t
     throw(TypeError, 'Unsupported type %r' % t.__name__)
 
 coercions = {
-    (int, float) : float,
-    (int, Decimal) : Decimal,
-    (date, datetime) : datetime,
-    (bool, int) : int,
-    (bool, float) : float,
-    (bool, Decimal) : Decimal
+    (int, float): float,
+    (int, Decimal): Decimal,
+    (date, datetime): datetime,
+    (bool, int): int,
+    (bool, float): float,
+    (bool, Decimal): Decimal
     }
 coercions.update(((t2, t1), t3) for ((t1, t2), t3) in items_list(coercions))
 
@@ -293,11 +336,80 @@ class TrackedList(TrackedValue, list):
     def get_untracked(self):
         return [val.get_untracked() if isinstance(val, TrackedValue) else val for val in self]
 
+def validate_item(item_type, item):
+    if PY2 and isinstance(item, str):
+        item = item.decode('ascii')
+    if not isinstance(item, item_type):
+        if item_type is not unicode and hasattr(item, '__index__'):
+            return item.__index__()
+        throw(TypeError, 'Cannot store %r item in array of %r' % (type(item).__name__, item_type.__name__))
+    return item
+
+class TrackedArray(TrackedList):
+    def __init__(self, obj, attr, value):
+        TrackedList.__init__(self, obj, attr, value)
+        self.item_type = attr.py_type.item_type
+    def extend(self, items):
+        items = [validate_item(self.item_type, item) for item in items]
+        TrackedList.extend(self, items)
+    def append(self, item):
+        item = validate_item(self.item_type, item)
+        TrackedList.append(self, item)
+    def insert(self, index, item):
+        item = validate_item(self.item_type, item)
+        TrackedList.insert(self, index, item)
+    def __setitem__(self, index, item):
+        item = validate_item(self.item_type, item)
+        TrackedList.__setitem__(self, index, item)
+
+    def __contains__(self, item):
+        if not isinstance(item, basestring) and hasattr(item, '__iter__'):
+            return all(it in set(self) for it in item)
+        return list.__contains__(self, item)
+
+
 class Json(object):
     """A wrapper over a dict or list
     """
+    @classmethod
+    def default_empty_value(cls):
+        return {}
+
     def __init__(self, wrapped):
         self.wrapped = wrapped
 
     def __repr__(self):
         return '<Json %r>' % self.wrapped
+
+class Array(object):
+    item_type = None  # Should be overridden in subclass
+
+    @classmethod
+    def default_empty_value(cls):
+        return []
+
+
+class IntArray(Array):
+    item_type = int
+
+
+class StrArray(Array):
+    item_type = unicode
+
+
+class FloatArray(Array):
+    item_type = float
+
+
+numeric_types = {bool, int, float, Decimal}
+comparable_types = {int, float, Decimal, unicode, date, time, datetime, timedelta, bool, UUID, IntArray, StrArray, FloatArray}
+primitive_types = comparable_types | {buffer}
+function_types = {type, types.FunctionType, types.BuiltinFunctionType}
+type_normalization_dict = { long : int } if PY2 else {}
+
+array_types = {
+    int: IntArray,
+    float: FloatArray,
+    unicode: StrArray
+}
+
